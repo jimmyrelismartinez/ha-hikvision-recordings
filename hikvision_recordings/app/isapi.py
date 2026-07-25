@@ -6,14 +6,19 @@ never writes to the device and never stores video.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Callable
+from datetime import datetime, timedelta, timezone
+from typing import AsyncIterator, Callable
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
+
+import httpx
+
+from .config import Config
 
 LOG = logging.getLogger(__name__)
 
@@ -163,3 +168,188 @@ def parse_search_response(
             )
         )
     return recordings
+
+
+# ── ISAPI client — clock, search call, streaming download, concurrency guard ─
+
+DEFAULT_CHUNK = 262144      # 256 KiB — big enough to keep ffmpeg fed, small enough to stream
+BUSY_TIMEOUT_S = 10.0       # how long to wait for a free DVR slot before saying "busy"
+
+
+@dataclass(frozen=True)
+class DvrClock:
+    """Translates between UTC and the DVR's wall clock.
+
+    The DVR labels timestamps with 'Z' but may mean local time (design spec 3.5).
+    `offset` is defined so that:  dvr_wallclock = utc + offset
+    """
+
+    offset: timedelta
+    source: str  # "device" | "configured" | "assumed_local" | "fallback_utc"
+
+    def to_dvr(self, dt_utc: datetime) -> str:
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        return (dt_utc.astimezone(timezone.utc) + self.offset).strftime(DVR_TIME_FMT)
+
+    def to_utc(self, naive_dvr: datetime) -> datetime:
+        return (naive_dvr - self.offset).replace(tzinfo=timezone.utc)
+
+
+def _offset_from_device_time(xml_text: str) -> timedelta | None:
+    """Derive the DVR wall-clock offset from <localTime>, e.g. 2026-07-24T13:20:29-05:00."""
+    root = ET.fromstring(xml_text)
+    raw = _first_text(root, "localTime")
+    if not raw:
+        return None
+    try:
+        aware = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if aware.utcoffset() is None:
+        return None
+    # Round to the nearest 15 minutes — every real timezone lands on one, and this
+    # absorbs the second-or-two of clock skew between us and the DVR.
+    minutes = round(aware.utcoffset().total_seconds() / 900) * 15
+    return timedelta(minutes=minutes)
+
+
+class IsapiClient:
+    """Async ISAPI client. One instance per add-on process."""
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._client = httpx.AsyncClient(
+            base_url=config.base_url,
+            auth=httpx.DigestAuth(config.dvr_username, config.dvr_password),
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            follow_redirects=False,
+        )
+        self._sem = asyncio.Semaphore(config.max_concurrent_downloads)
+        self.clock = DvrClock(offset=timedelta(0), source="fallback_utc")
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def ping(self) -> None:
+        """Cheap reachability + auth check for /api/health.
+
+        Deliberately NOT a search: a zero-width or degenerate timeSpan has unknown
+        firmware behaviour and could report a healthy DVR as unreachable. System/time
+        exercises the same network path and the same digest auth, and nothing else.
+        """
+        try:
+            response = await self._client.get(TIME_PATH)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+            raise DvrUnreachable(
+                f"Can't reach the DVR at {self._config.dvr_host}."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise DvrUnreachable(f"DVR request failed: {exc}") from exc
+        if response.status_code == 401:
+            raise DvrAuthError("The DVR rejected the username or password.")
+        if response.status_code >= 400:
+            raise DvrUnreachable(f"DVR returned HTTP {response.status_code}.")
+
+    async def probe_clock(self) -> DvrClock:
+        """Work out how the DVR labels time. Never fatal — falls back with a warning."""
+        mode = self._config.dvr_time_mode
+        if mode == "utc":
+            self.clock = DvrClock(timedelta(0), "configured")
+            return self.clock
+        if mode == "local":
+            local_offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+            self.clock = DvrClock(local_offset, "configured")
+            return self.clock
+
+        try:
+            response = await self._client.get(TIME_PATH)
+            response.raise_for_status()
+            offset = _offset_from_device_time(response.text)
+        except (httpx.HTTPError, ET.ParseError) as exc:
+            LOG.warning("could not read DVR time (%s); assuming host-local wall clock", exc)
+            offset = None
+
+        if offset is None:
+            fallback = datetime.now().astimezone().utcoffset() or timedelta(0)
+            self.clock = DvrClock(fallback, "assumed_local")
+        else:
+            self.clock = DvrClock(offset, "device")
+        LOG.info("DVR clock offset %s (source=%s)", self.clock.offset, self.clock.source)
+        return self.clock
+
+    async def search(
+        self,
+        channel: int,
+        start_utc: datetime,
+        end_utc: datetime,
+        max_results: int | None = None,
+    ) -> list[Recording]:
+        body = build_search_body(
+            channel,
+            self.clock.to_dvr(start_utc),
+            self.clock.to_dvr(end_utc),
+            max_results or self._config.max_results,
+        )
+        try:
+            response = await self._client.post(
+                SEARCH_PATH, content=body.encode("utf-8"), headers=XML_HEADERS
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+            raise DvrUnreachable(
+                f"Can't reach the DVR at {self._config.dvr_host}. "
+                "Is it powered on and on the network?"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise DvrUnreachable(f"DVR request failed: {exc}") from exc
+
+        if response.status_code == 401:
+            raise DvrAuthError(
+                "The DVR rejected the username or password — "
+                "check the add-on configuration."
+            )
+        if response.status_code >= 500:
+            raise DvrBusy("The DVR is busy. Try again in a moment.")
+        if response.status_code >= 400:
+            raise DvrBadRequest(f"The DVR rejected the search (HTTP {response.status_code}).")
+
+        return parse_search_response(response.text, channel, self.clock.to_utc)
+
+    async def stream_download(
+        self, playback_uri: str, chunk_size: int = DEFAULT_CHUNK
+    ) -> AsyncIterator[bytes]:
+        """Yield the recording's raw bytes (Hikvision MPEG-PS). Nothing is buffered to disk."""
+        body = (
+            "<downloadRequest>"
+            f"<playbackURI>{xml_escape(playback_uri)}</playbackURI>"
+            "</downloadRequest>"
+        )
+        try:
+            await asyncio.wait_for(self._sem.acquire(), timeout=BUSY_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise DvrBusy(
+                "DVR is busy serving another stream. Try again in a moment."
+            ) from exc
+        try:
+            async with self._client.stream(
+                "POST", DOWNLOAD_PATH, content=body.encode("utf-8"), headers=XML_HEADERS
+            ) as response:
+                if response.status_code == 401:
+                    raise DvrAuthError(
+                        "The DVR rejected the username or password — "
+                        "check the add-on configuration."
+                    )
+                if response.status_code >= 500:
+                    raise DvrBusy("DVR is busy serving another stream. Try again in a moment.")
+                if response.status_code >= 400:
+                    raise DvrBadRequest(
+                        f"The DVR refused the download (HTTP {response.status_code})."
+                    )
+                async for chunk in response.aiter_bytes(chunk_size):
+                    yield chunk
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+            raise DvrUnreachable(
+                f"Lost the connection to the DVR at {self._config.dvr_host}."
+            ) from exc
+        finally:
+            self._sem.release()
