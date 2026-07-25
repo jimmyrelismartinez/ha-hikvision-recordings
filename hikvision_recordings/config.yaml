@@ -40,4 +40,4 @@ schema:
       name: str
   max_results: int(1,200)
   max_concurrent_downloads: int(1,4)
-  log_level: list(trace|debug|info|warning|error|fatal)
+  log_level: list(trace|debug|info|warning|error|critical)
