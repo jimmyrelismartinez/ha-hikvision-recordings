@@ -80,3 +80,9 @@ def test_load_from_file(tmp_path):
 def test_missing_file_raises(tmp_path):
     with pytest.raises(ConfigError):
         load_config_from_file(str(tmp_path / "nope.json"))
+
+
+def test_password_is_not_in_repr():
+    cfg = load_config(VALID)
+    assert "s3cret" not in repr(cfg)
+    assert cfg.dvr_password == "s3cret"  # still readable by the code that needs it

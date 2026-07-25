@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DEFAULT_OPTIONS_PATH = "/data/options.json"
 VALID_TIME_MODES = ("auto", "local", "utc")
@@ -28,7 +28,7 @@ class Channel:
 class Config:
     dvr_host: str
     dvr_username: str
-    dvr_password: str
+    dvr_password: str = field(repr=False)
     channels: tuple[Channel, ...]
     dvr_port: int = 80
     dvr_use_https: bool = False
