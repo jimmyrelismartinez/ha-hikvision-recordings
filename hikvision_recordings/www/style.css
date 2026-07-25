@@ -1,0 +1,73 @@
+:root {
+  --bg: #111418;
+  --panel: #1c2128;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #3d8bfd;
+  --bad: #f85149;
+  --ok: #3fb950;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 1rem;
+  font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 1rem; }
+h1 { font-size: 1.35rem; margin: 0; }
+.status { font-size: 0.8rem; color: var(--muted); }
+.status.ok { color: var(--ok); }
+.status.bad { color: var(--bad); }
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.75rem;
+  background: var(--panel);
+  padding: 1rem;
+  border-radius: 12px;
+}
+.controls label { display: flex; flex-direction: column; font-size: 0.8rem; color: var(--muted); gap: 0.25rem; }
+.controls input, .controls select {
+  font-size: 1rem; padding: 0.5rem; border-radius: 8px;
+  border: 1px solid #30363d; background: #0d1117; color: var(--text);
+}
+.presets { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.presets button {
+  background: #0d1117; color: var(--text); border: 1px solid #30363d;
+  border-radius: 999px; padding: 0.35rem 0.8rem; font-size: 0.85rem;
+}
+button.primary {
+  grid-column: 1 / -1; background: var(--accent); color: #fff; border: 0;
+  border-radius: 8px; padding: 0.7rem; font-size: 1rem; font-weight: 600;
+}
+button.primary:disabled { opacity: 0.6; }
+
+.message { margin: 1rem 0 0.5rem; color: var(--muted); }
+.message.bad { color: var(--bad); }
+
+.results { list-style: none; padding: 0; margin: 0.5rem 0 0; }
+.clip { background: var(--panel); border-radius: 12px; margin-bottom: 0.6rem; overflow: hidden; }
+.clip-header {
+  width: 100%; display: flex; align-items: center; gap: 0.75rem;
+  background: none; border: 0; color: var(--text); padding: 0.9rem 1rem;
+  font-size: 1rem; text-align: left;
+}
+.clip-time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.clip-meta { color: var(--muted); font-size: 0.85rem; }
+.clip-chip {
+  margin-left: auto; background: #0d1117; border: 1px solid #30363d;
+  border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.75rem; color: var(--muted);
+}
+.clip-body { padding: 0 1rem 1rem; }
+.clip-body video { width: 100%; border-radius: 8px; background: #000; }
+.hint { color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
+.download {
+  display: inline-block; background: var(--accent); color: #fff;
+  text-decoration: none; border-radius: 8px; padding: 0.6rem 1.1rem; font-weight: 600;
+}

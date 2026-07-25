@@ -1,1 +1,44 @@
-<!doctype html><title>DVR Recordings</title><p>placeholder</p>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Belt and braces for Ingress: every relative URL resolves against this. -->
+  <base href="./">
+  <title>DVR Recordings</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Recordings</h1>
+    <span id="status" class="status"></span>
+  </header>
+
+  <form id="search-form" class="controls">
+    <label>Camera
+      <select id="channel" required></select>
+    </label>
+    <label>Date
+      <input type="date" id="date" required>
+    </label>
+    <label>From
+      <input type="time" id="from" value="00:00" step="60" required>
+    </label>
+    <label>To
+      <input type="time" id="to" value="23:59" step="60" required>
+    </label>
+    <div class="presets">
+      <button type="button" data-preset="1h">Last hour</button>
+      <button type="button" data-preset="6h">Last 6 h</button>
+      <button type="button" data-preset="today">Today</button>
+      <button type="button" data-preset="yesterday">Yesterday</button>
+    </div>
+    <button type="submit" class="primary" id="search-button">Search</button>
+  </form>
+
+  <p id="message" class="message" hidden></p>
+  <ul id="results" class="results"></ul>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -30,6 +30,13 @@ index over ISAPI and streams existing clips straight through to your browser.
   frontend + 401 on `/api/` at :9123).
 - Slug collision check + arch confirmation on the :9123 instance is PENDING — owner to verify
   in the HA UI before install (requires human login; not checked programmatically).
+- Frontend (`hikvision_recordings/www/`) is a plain single-page app served by the FastAPI
+  app — no build step, no framework, no CDN. Every URL it fetches is relative
+  (`api/channels`, not `/api/channels`) so it survives Home Assistant's rotating Ingress
+  path prefix. Verified offline (unreachable-DVR smoke test + grep for absolute-path URLs);
+  live-DVR click-through and the iOS playback check are PENDING — owner to verify per the
+  Task 9 Step 4 checklist (camera list, timestamp accuracy against `dvr_time_mode`, playback
+  latency, download/seek, empty-range message, and the iOS `Accept-Ranges: none` check).
 
 ## Verified DVR behaviour
 
