@@ -97,10 +97,20 @@ function renderClip(clip) {
   const header = document.createElement('button');
   header.type = 'button';
   header.className = 'clip-header';
-  header.innerHTML =
-    `<span class="clip-time">${start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>` +
-    `<span class="clip-meta">${formatDuration(clip.duration_s)} · ${formatSize(clip.size_bytes)}</span>` +
-    `<span class="clip-chip">${clip.channel_name}</span>`;
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'clip-time';
+  timeSpan.textContent = start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  const metaSpan = document.createElement('span');
+  metaSpan.className = 'clip-meta';
+  metaSpan.textContent = `${formatDuration(clip.duration_s)} · ${formatSize(clip.size_bytes)}`;
+
+  const chipSpan = document.createElement('span');
+  chipSpan.className = 'clip-chip';
+  chipSpan.textContent = clip.channel_name;
+
+  header.append(timeSpan, metaSpan, chipSpan);
 
   const body = document.createElement('div');
   body.className = 'clip-body';
@@ -136,11 +146,18 @@ function renderClip(clip) {
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   results.innerHTML = '';
-  showMessage('Searching…');
   searchButton.disabled = true;
 
   const start = new Date(`${dateInput.value}T${fromInput.value}:00`);
   const end = new Date(`${dateInput.value}T${toInput.value}:59`);
+  // "From" can be later in the clock than "To" (e.g. a "Last 6 h" preset run at 00:30,
+  // or someone typing 23:00 → 01:00 by hand) — both mean the range crosses midnight into
+  // the next day. Roll `end` forward a day rather than rejecting or silently mangling it.
+  if (end <= start) {
+    end.setDate(end.getDate() + 1);
+  }
+  showMessage(`Searching ${localDate(start)} ${localTime(start)} → ${localDate(end)} ${localTime(end)}…`);
+
   const params = new URLSearchParams({
     channel: channelSelect.value,
     start: start.toISOString(),
