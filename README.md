@@ -19,8 +19,32 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Notes
 
-- Seeking inside a clip is not supported (the DVR streams one-shot, no HTTP Range).
-  Playback works; to scrub, download the clip.
+### Playback is staged; download is streamed
+
+**Inline playback (`/api/stream`) stages the clip to RAM first.** Verified live on
+2026-07-25: a chunked response with `Accept-Ranges: none` and no `Content-Length`
+makes iOS Safari / the HA Companion WKWebView refuse to start `<video>` at all —
+the crossed-out "media unsupported" icon — even though the bytes were a perfectly
+valid H.264 MP4 (ffprobe-confirmed, and Download of the same clip worked). WebKit
+wants a seekable response. So the remuxed clip is written to a temp file and served
+with `FileResponse`, which supplies `Content-Length`, `Accept-Ranges: bytes` and
+206 range replies. **Seeking/scrubbing works as a result.**
+
+**This does not break the add-on's zero-persistence promise**, which is enforced three ways:
+1. `config.yaml` sets `tmpfs: true`, so the container's `/tmp` is a RAM filesystem —
+   staged clips never touch the Pi's disk. **Do not remove that key.**
+2. The staged file is unlinked by a background task the instant the response finishes.
+3. A sweep removes anything a crashed response left behind, so orphans cannot accumulate.
+
+Nothing is ever written to the add-on's persistent `/data`, and nothing survives a restart.
+
+Trade-offs: playback starts once the clip is staged rather than immediately (a few
+seconds for a typical 20–60 MB clip), and clips above `max_stage_mb` (default 256 MB)
+are refused with a 413 pointing at Download rather than filling RAM.
+
+**Download (`/api/download`) still streams straight through with no staging** — it is
+a plain browser download that does not need Range. Verified live: byte-identical
+output to the staged path, valid MP4.
 - Base image: `3.12-alpine3.22` — common to `aarch64-base-python`, `armv7-base-python`, and
   `amd64-base-python` (verified: manifest pulls HTTP 200 on all three, 2026-07-25). Matches
   the dev `.venv` Python (3.12.3) exactly — no dev/prod runtime skew. Task 10's `build.yaml`

@@ -8,6 +8,10 @@ arch:
   - armv7
   - amd64
 init: false
+# /tmp becomes a RAM filesystem. Clips are staged there so playback responses can
+# answer Range requests (iOS will not play a video without it) — and staging in RAM
+# is what keeps the zero-persistence guarantee intact. Do not remove.
+tmpfs: true
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:cctv
@@ -27,6 +31,7 @@ options:
       name: Camera 1
   max_results: 40
   max_concurrent_downloads: 2
+  max_stage_mb: 256
   log_level: info
 schema:
   dvr_host: str
@@ -40,4 +45,5 @@ schema:
       name: str
   max_results: int(1,200)
   max_concurrent_downloads: int(1,4)
+  max_stage_mb: int(16,1024)
   log_level: list(trace|debug|info|warning|error|critical)

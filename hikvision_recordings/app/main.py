@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import tempfile
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +18,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from .config import Config, load_config_from_file
 from .isapi import (
@@ -33,6 +36,40 @@ from .remux import RemuxError, remux_to_fmp4
 VERSION = "0.1.0"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
+
+# Where clips are staged for Range-capable playback. config.yaml sets `tmpfs: true`
+# so this is RAM inside the add-on container, never the Pi's disk.
+STAGING_DIR = Path(os.environ.get("ADDON_STAGING_DIR", "/tmp"))
+STAGE_PREFIX = "hikclip-"
+STAGE_MAX_AGE_S = 900.0   # a staged file older than this is orphaned; sweep it
+
+
+def _discard_stage(path: Path) -> None:
+    """Delete one staged clip. Runs as a BackgroundTask once the response is done."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("could not remove staged clip %s: %s", path, exc)
+
+
+def _sweep_stale_stages() -> None:
+    """Remove staged clips a previous request failed to clean up.
+
+    Belt-and-braces for the zero-persistence guarantee: if the process is killed
+    mid-response its BackgroundTask never runs, and without this the next restart
+    would inherit that file. Cheap - one directory listing per staging call.
+    """
+    now = time.time()
+    try:
+        for leftover in STAGING_DIR.glob(f"{STAGE_PREFIX}*"):
+            try:
+                if now - leftover.stat().st_mtime > STAGE_MAX_AGE_S:
+                    leftover.unlink(missing_ok=True)
+                    LOG.warning("swept orphaned staged clip %s", leftover)
+            except OSError:
+                continue
+    except OSError:  # pragma: no cover - staging dir missing
+        pass
 
 ERROR_STATUS = {
     DvrAuthError: 401,
@@ -70,6 +107,7 @@ def _safe_filename(channel_name: str, recording: Recording, extension: str) -> s
 def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
     names = {channel.id: channel.name for channel in config.channels}
     registry = ClipRegistry(dvr_host=config.dvr_host)
+    max_stage_bytes = config.max_stage_mb * 1024 * 1024
     dvr = client or IsapiClient(config)
 
     @asynccontextmanager
@@ -208,12 +246,86 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
     @app.get("/api/stream/{clip_id}")
     async def stream(clip_id: str, request: Request):
         recording = _lookup(clip_id)
-        body = await _open_video_stream(recording, raw=False, request=request)
-        return StreamingResponse(
-            body,
+        # Staged to a RAM-backed file rather than streamed, so the response carries
+        # Content-Length and answers Range — without which iOS refuses to play at
+        # all. See _stage_clip() for the full reasoning and the cleanup guarantees.
+        path = await _stage_clip(recording, raw=False)
+        return FileResponse(
+            path,
             media_type="video/mp4",
-            headers={"Cache-Control": "no-store", "Accept-Ranges": "none"},
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(_discard_stage, path),
         )
+
+    async def _stage_clip(recording: Recording, raw: bool) -> Path:
+        """Write the remuxed clip to a RAM-backed temp file and return its path.
+
+        WHY THIS EXISTS — iOS, verified live 2026-07-25 (spec section 7):
+        A chunked StreamingResponse carries no Content-Length and cannot answer a
+        Range request. iOS Safari / the HA Companion WKWebView refuse to initialise
+        <video> against such a response — Ramon got the crossed-out "media
+        unsupported" icon even though the bytes were a perfectly valid H.264 MP4
+        (ffprobe-confirmed, and Download of the very same clip worked). Staging to a
+        real file lets Starlette's FileResponse answer with Content-Length +
+        Accept-Ranges: bytes and serve 206 slices, which is what WebKit needs.
+
+        ZERO-PERSISTENCE IS STILL HONOURED, and this is the one place it could be
+        broken, so it is enforced three ways:
+          1. The file lives under STAGING_DIR (/tmp), which config.yaml declares as
+             `tmpfs: true` — RAM, never the Pi's SD card / disk.
+          2. It is unlinked by a BackgroundTask the moment the response completes.
+          3. _sweep_stale_stages() removes anything a missed cleanup left behind, so
+             a crash mid-response cannot accumulate clips.
+        Nothing survives a container restart, and nothing is ever written to the
+        add-on's persistent /data.
+        """
+        _sweep_stale_stages()
+        source = dvr.stream_download(recording.playback_uri)
+        pipeline = source if raw else remux_to_fmp4(source)
+        iterator = pipeline.__aiter__()
+
+        fd, path_str = tempfile.mkstemp(
+            prefix="hikclip-", suffix=".mp4", dir=str(STAGING_DIR)
+        )
+        path = Path(path_str)
+        written = 0
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                async for chunk in iterator:
+                    written += len(chunk)
+                    if written > max_stage_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                "That clip is too large to prepare for in-browser "
+                                f"playback (over {max_stage_bytes // (1024 * 1024)} MB). "
+                                "Use Download instead."
+                            ),
+                        )
+                    handle.write(chunk)
+        except DvrError as exc:
+            path.unlink(missing_ok=True)
+            raise _http_error(exc) from exc
+        except RemuxError as exc:
+            path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=500, detail="Couldn't prepare this clip for playback."
+            ) from exc
+        except BaseException:
+            # Includes the 413 above and client-disconnect cancellation.
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            # Release the DVR session permit immediately rather than at GC — same
+            # reasoning as the streaming path's aclose().
+            await iterator.aclose()
+
+        if written == 0:
+            path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=502, detail="The DVR returned an empty clip."
+            )
+        return path
 
     @app.get("/api/download/{clip_id}")
     async def download(clip_id: str, request: Request, raw: int = 0):

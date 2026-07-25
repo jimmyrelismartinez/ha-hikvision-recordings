@@ -40,6 +40,7 @@ class Config:
     dvr_time_mode: str = "auto"
     max_results: int = 40
     max_concurrent_downloads: int = 2
+    max_stage_mb: int = 256
     log_level: str = "info"
 
     @property
@@ -84,6 +85,7 @@ def load_config(raw: dict) -> Config:
         dvr_time_mode=time_mode,
         max_results=int(raw.get("max_results", 40)),
         max_concurrent_downloads=int(raw.get("max_concurrent_downloads", 2)),
+        max_stage_mb=int(raw.get("max_stage_mb", 256)),
         log_level=str(raw.get("log_level", "info")),
     )
 
