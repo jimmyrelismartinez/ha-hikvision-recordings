@@ -61,3 +61,43 @@ def test_non_rtsp_uri_is_rejected():
     reg = ClipRegistry(dvr_host="10.10.11.56")
     with pytest.raises(InvalidPlaybackUri):
         reg.put(make_recording(uri="http://10.10.11.56/etc/passwd"))
+
+
+def test_traversal_in_query_string_is_rejected():
+    """Path traversal attack in the query string must be rejected."""
+    reg = ClipRegistry(dvr_host="10.10.11.56")
+    with pytest.raises(InvalidPlaybackUri):
+        reg.put(make_recording(uri="rtsp://10.10.11.56/Streaming/tracks/101/?a=1/../../../etc/passwd"))
+
+
+def test_crlf_in_query_string_is_rejected():
+    """CRLF injection in query string must be rejected."""
+    reg = ClipRegistry(dvr_host="10.10.11.56")
+    with pytest.raises(InvalidPlaybackUri):
+        reg.put(make_recording(uri="rtsp://10.10.11.56/Streaming/tracks/101/?a=1\r\nEvil-Header: 1"))
+
+
+def test_nul_in_query_string_is_rejected():
+    """NUL byte injection in query string must be rejected."""
+    reg = ClipRegistry(dvr_host="10.10.11.56")
+    with pytest.raises(InvalidPlaybackUri):
+        reg.put(make_recording(uri="rtsp://10.10.11.56/Streaming/tracks/101/?a=1\x00.evil.com"))
+
+
+def test_real_playback_uri_from_hikvision_still_works():
+    """Real URIs from Hikvision search response must work."""
+    reg = ClipRegistry(dvr_host="10.10.11.56")
+    real_uri = "rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260724T132029Z&endtime=20260724T132142Z&name=00000000002000001&size=32947084"
+    clip_id = reg.put(make_recording(uri=real_uri))
+    assert reg.get(clip_id).playback_uri == real_uri
+
+
+def test_error_message_names_both_hosts():
+    """Error message must name both expected and actual hosts for diagnostics."""
+    reg = ClipRegistry(dvr_host="10.10.11.56")
+    with pytest.raises(InvalidPlaybackUri) as exc_info:
+        reg.put(make_recording(uri="rtsp://dvr.local/Streaming/tracks/101/?a=1"))
+    msg = str(exc_info.value)
+    assert "dvr.local" in msg, "error must name the actual host in the URI"
+    assert "10.10.11.56" in msg, "error must name the configured dvr_host"
+    assert "set dvr_host to that IP" in msg, "error must hint at the solution"

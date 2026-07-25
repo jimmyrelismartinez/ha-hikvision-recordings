@@ -9,7 +9,7 @@ index over ISAPI and streams existing clips straight through to your browser.
 1. Settings → Add-ons → Add-on Store → ⋮ → Repositories
 2. Add `https://github.com/jimmyrelismartinez/ha-hikvision-recordings`
 3. Install **DVR Recordings**, open Configuration, fill in:
-   - `dvr_host` — DVR IP (e.g. `10.10.11.56`)
+   - `dvr_host` — DVR IP (e.g. `10.10.11.56`). Must match the IP/hostname the DVR reports in its own playback URIs. For Hikvision, this is typically the DVR's IP address, not a hostname.
    - `dvr_username` / `dvr_password` — a DVR account with playback rights
    - `channels` — one row per camera: `id` (e.g. `101`) and `name` (e.g. `Driveway`)
 4. Start. The panel appears in the sidebar as **Recordings**.

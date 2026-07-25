@@ -11,6 +11,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from .isapi import Recording
 
@@ -42,20 +43,42 @@ class ClipRegistry:
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
         self._ttl_s = ttl_s
         self._capacity = capacity
+        self._dvr_host = dvr_host
         # Defence in depth: even though every URI here came from the DVR's own
         # search response, re-validate it before it can ever be sent back.
+        # Use fullmatch to anchor the entire string (prefix AND suffix).
+        # Query string is restricted to conservative allowlist to reject CR/LF/NUL.
         self._pattern = re.compile(
-            rf"^rtsp://{re.escape(dvr_host)}(?::\d+)?/Streaming/tracks/\d+/\?"
+            rf"^rtsp://{re.escape(dvr_host)}(?::\d+)?/Streaming/tracks/\d+/\?[A-Za-z0-9=&%._:+-]*\Z"
         )
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def put(self, recording: Recording) -> str:
-        if not self._pattern.match(recording.playback_uri):
+        uri = recording.playback_uri
+
+        # Reject CR, LF, NUL, and other dangerous characters outright
+        if any(c in uri for c in '\r\n\x00'):
             raise InvalidPlaybackUri(
-                "playbackURI does not point at the configured DVR — refusing to store it"
+                f"playbackURI contains forbidden characters — refusing to store it"
             )
+
+        # Use fullmatch (not match) to validate the entire URI
+        if not self._pattern.fullmatch(uri):
+            # Extract the actual host from the URI for a diagnostic message
+            try:
+                parsed = urlparse(uri)
+                actual_host = parsed.hostname or "unknown"
+            except Exception:
+                actual_host = "unknown"
+
+            raise InvalidPlaybackUri(
+                f"playbackURI host '{actual_host}' does not match the configured "
+                f"dvr_host '{self._dvr_host}' — if your DVR reports its IP here, "
+                f"set dvr_host to that IP"
+            )
+
         self._purge()
         clip_id = secrets.token_urlsafe(12)
         self._entries[clip_id] = _Entry(recording, time.monotonic() + self._ttl_s)
