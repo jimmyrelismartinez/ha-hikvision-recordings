@@ -10,7 +10,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -100,8 +100,11 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             state = "unreachable"
         return {
             "dvr": state,
+            # Offset actually applied to queries, plus how far the device's clock sits
+            # from a whole-hour zone (i.e. the part that is a wrong clock, not a zone).
             "clock_offset_s": int(dvr.clock.offset.total_seconds()),
             "clock_source": dvr.clock.source,
+            "clock_drift_s": int(getattr(dvr.clock, "drift", timedelta(0)).total_seconds()),
             "version": VERSION,
         }
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -174,18 +175,45 @@ def parse_search_response(
 
 DEFAULT_CHUNK = 262144      # 256 KiB — big enough to keep ffmpeg fed, small enough to stream
 BUSY_TIMEOUT_S = 10.0       # how long to wait for a free DVR slot before saying "busy"
+CLOCK_TTL_S = 300.0         # re-measure the DVR clock at least this often (drift + DST)
 
 
 @dataclass(frozen=True)
 class DvrClock:
     """Translates between UTC and the DVR's wall clock.
 
-    The DVR labels timestamps with 'Z' but may mean local time (design spec 3.5).
     `offset` is defined so that:  dvr_wallclock = utc + offset
+
+    ── HOW THIS DVR ACTUALLY BEHAVES — VERIFIED LIVE 2026-07-25 ──────────────────
+    On DVR-THD30B-81-HIK, ContentMgmt/search timestamps are the device's LOCAL wall
+    clock wearing a bogus 'Z'. Measured head-to-head over the last 40 real minutes,
+    searching for recordings that demonstrably existed:
+        offset 0  (treat 'Z' as true UTC) -> ch101=0  ch301=0   MISS
+        offset -6h (declared in <localTime>) -> ch101=0  ch301=0   MISS
+        offset measured from the device clock -> ch101=1  ch301=4   HIT
+    Beware the trap that produced two wrong conclusions before this was settled:
+    a WIDE search window (say 6h) numerically spans both frames, so it returns
+    matches under either hypothesis and looks like proof. Only a NARROW window
+    discriminates.
+
+    ── WHY WE MEASURE THE OFFSET INSTEAD OF READING IT ───────────────────────────
+    The offset is NOT taken from the UTC offset declared in <localTime>. That field
+    reported -06:00 (base CST) while the device's clock was actually running at
+    UTC-5 (CDT) and was ~12 min adrift, so trusting the declared value put every
+    query 47:54 off target and returned nothing. We instead measure
+        offset = device_wall_clock_naive - our_utc_now
+    which absorbs the DST error AND the device's clock drift in one step, and is
+    self-correcting: a firmware whose search endpoint really is UTC-honest reports
+    a wall clock equal to UTC, measures ~0, and gets no shift applied. Do not
+    "simplify" this back to reading the declared offset.
+    ──────────────────────────────────────────────────────────────────────────────
     """
 
     offset: timedelta
-    source: str  # "device" | "configured" | "assumed_local" | "fallback_utc"
+    source: str  # "measured" | "configured" | "stale" | "fallback_utc"
+    # Wall-clock skew of the device against real UTC, for display/health only.
+    # A device on a correct UTC-5 zone with a perfect clock shows ~0 here.
+    drift: timedelta = timedelta(0)
 
     def to_dvr(self, dt_utc: datetime) -> str:
         if dt_utc.tzinfo is None:
@@ -196,8 +224,31 @@ class DvrClock:
         return (naive_dvr - self.offset).replace(tzinfo=timezone.utc)
 
 
+def _device_wall_clock(xml_text: str) -> datetime | None:
+    """Read the device's own wall-clock reading from <localTime>, as a NAIVE datetime.
+
+    Deliberately discards the declared UTC offset: it reported the base zone (-06:00)
+    while the clock ran on DST (-05:00), which is what broke every query. Only the
+    wall-clock face value is used; the offset is measured against our UTC instead.
+    """
+    root = ET.fromstring(xml_text)
+    raw = _first_text(root, "localTime")
+    if not raw:
+        return None
+    try:
+        aware = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return aware.replace(tzinfo=None)
+
+
 def _offset_from_device_time(xml_text: str) -> timedelta | None:
-    """Derive the DVR wall-clock offset from <localTime>, e.g. 2026-07-24T13:20:29-05:00."""
+    """Derive the DVR wall-clock offset from <localTime>, e.g. 2026-07-24T13:20:29-05:00.
+
+    RETAINED FOR `dvr_time_mode: declared` ONLY. This is what the code originally used
+    everywhere, and it is wrong on this hardware whenever DST is in effect — see the
+    DvrClock docstring. Do not wire it back into the default path.
+    """
     root = ET.fromstring(xml_text)
     raw = _first_text(root, "localTime")
     if not raw:
@@ -227,6 +278,7 @@ class IsapiClient:
         )
         self._sem = asyncio.Semaphore(config.max_concurrent_downloads)
         self.clock = DvrClock(offset=timedelta(0), source="fallback_utc")
+        self._clock_measured_at = 0.0
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -251,32 +303,86 @@ class IsapiClient:
         if response.status_code >= 400:
             raise DvrUnreachable(f"DVR returned HTTP {response.status_code}.")
 
-    async def probe_clock(self) -> DvrClock:
-        """Work out how the DVR labels time. Never fatal — falls back with a warning."""
+    async def probe_clock(self, now_utc: datetime | None = None) -> DvrClock:
+        """Measure how this DVR labels time. Never fatal — degrades with a warning.
+
+        `now_utc` is injectable so tests can pin "now" and assert the exact window
+        that goes on the wire.
+        """
+        now_utc = now_utc or datetime.now(timezone.utc)
         mode = self._config.dvr_time_mode
+
         if mode == "utc":
+            # Explicit "the search endpoint is UTC-honest" override. Verified WRONG for
+            # DVR-THD30B-81-HIK (returns zero matches) — kept for other firmwares.
             self.clock = DvrClock(timedelta(0), "configured")
+            self._clock_measured_at = time.monotonic()
             return self.clock
         if mode == "local":
             local_offset = datetime.now().astimezone().utcoffset() or timedelta(0)
             self.clock = DvrClock(local_offset, "configured")
+            self._clock_measured_at = time.monotonic()
+            return self.clock
+        if mode == "declared":
+            try:
+                response = await self._client.get(TIME_PATH)
+                response.raise_for_status()
+                declared = _offset_from_device_time(response.text)
+            except (httpx.HTTPError, ET.ParseError):
+                declared = None
+            self.clock = DvrClock(declared or timedelta(0), "configured")
+            self._clock_measured_at = time.monotonic()
             return self.clock
 
+        # mode == "auto": measure the device's clock against ours.
         try:
             response = await self._client.get(TIME_PATH)
             response.raise_for_status()
-            offset = _offset_from_device_time(response.text)
+            device_wall = _device_wall_clock(response.text)
         except (httpx.HTTPError, ET.ParseError) as exc:
-            LOG.warning("could not read DVR time (%s); assuming host-local wall clock", exc)
-            offset = None
+            LOG.warning("could not read DVR time (%s)", exc)
+            device_wall = None
 
-        if offset is None:
-            fallback = datetime.now().astimezone().utcoffset() or timedelta(0)
-            self.clock = DvrClock(fallback, "assumed_local")
-        else:
-            self.clock = DvrClock(offset, "device")
-        LOG.info("DVR clock offset %s (source=%s)", self.clock.offset, self.clock.source)
+        if device_wall is None:
+            # Keep the last good measurement rather than inventing one. Assuming the
+            # host's local zone is what produced the original bug, so we do NOT do that.
+            if self.clock.source in ("measured", "stale"):
+                self.clock = DvrClock(self.clock.offset, "stale", self.clock.drift)
+                LOG.warning("DVR clock unreadable; reusing last measured offset %s",
+                            self.clock.offset)
+            else:
+                self.clock = DvrClock(timedelta(0), "fallback_utc")
+                LOG.error("DVR clock unreadable and never measured; searches may miss")
+            return self.clock
+
+        naive_now = now_utc.astimezone(timezone.utc).replace(tzinfo=None)
+        # Whole seconds: sub-second precision here is meaningless (it is just when the
+        # HTTP round-trip landed) and would otherwise leak microseconds into every
+        # reported clip timestamp.
+        offset = timedelta(seconds=round((device_wall - naive_now).total_seconds()))
+        # Drift = how far the device's clock sits from the nearest whole-hour zone,
+        # i.e. the part of the offset that is a wrong clock rather than a timezone.
+        drift = offset - timedelta(hours=round(offset.total_seconds() / 3600))
+        self.clock = DvrClock(offset, "measured", drift)
+        self._clock_measured_at = time.monotonic()
+        LOG.info(
+            "DVR clock measured: offset %s (device reads %s, our UTC %s, drift %s)",
+            offset, device_wall, naive_now, drift,
+        )
         return self.clock
+
+    async def _fresh_clock(self) -> DvrClock:
+        """Re-measure if the cached offset is stale.
+
+        The device's clock drifts (~12 min observed on this unit) and DST transitions
+        move the offset by an hour, so a once-at-startup measurement silently rots.
+        """
+        if (
+            self.clock.source == "configured"
+            or time.monotonic() - self._clock_measured_at < CLOCK_TTL_S
+        ):
+            return self.clock
+        return await self.probe_clock()
 
     async def search(
         self,
@@ -285,10 +391,11 @@ class IsapiClient:
         end_utc: datetime,
         max_results: int | None = None,
     ) -> list[Recording]:
+        clock = await self._fresh_clock()
         body = build_search_body(
             channel,
-            self.clock.to_dvr(start_utc),
-            self.clock.to_dvr(end_utc),
+            clock.to_dvr(start_utc),
+            clock.to_dvr(end_utc),
             max_results or self._config.max_results,
         )
         try:
@@ -313,7 +420,7 @@ class IsapiClient:
         if response.status_code >= 400:
             raise DvrBadRequest(f"The DVR rejected the search (HTTP {response.status_code}).")
 
-        return parse_search_response(response.text, channel, self.clock.to_utc)
+        return parse_search_response(response.text, channel, clock.to_utc)
 
     async def stream_download(
         self, playback_uri: str, chunk_size: int = DEFAULT_CHUNK

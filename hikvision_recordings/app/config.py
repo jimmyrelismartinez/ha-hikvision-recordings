@@ -11,7 +11,12 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_OPTIONS_PATH = "/data/options.json"
-VALID_TIME_MODES = ("auto", "local", "utc")
+# "auto"     = measure the offset against the device clock (correct on DVR-THD30B-81-HIK)
+# "utc"      = trust 'Z' as true UTC, apply no shift
+# "local"    = apply the HOST's local offset
+# "declared" = apply the UTC offset the device declares in <localTime> (the old default;
+#              wrong under DST on this hardware — kept only as an escape hatch)
+VALID_TIME_MODES = ("auto", "utc", "local", "declared")
 
 
 class ConfigError(ValueError):

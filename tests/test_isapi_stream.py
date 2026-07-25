@@ -33,14 +33,28 @@ def make_client(**overrides) -> IsapiClient:
 
 @respx.mock
 async def test_probe_clock_uses_device_time(device_time):
+    """The healthy case: a device whose clock agrees with its declared zone.
+
+    The fixture reads 13:20:29 and declares -05:00, so if we pin "now" to the UTC
+    instant that corresponds to (18:20:29Z), the MEASURED offset lands on exactly
+    -5h and the round-trip is unchanged.
+
+    Note this case cannot tell measuring apart from reading the declared offset —
+    they agree here by construction. The discriminating tests, covering the live
+    2026-07-25 bug where the device's clock did NOT match its declared zone, are in
+    tests/test_isapi_clock.py. Do not "simplify" this back to asserting
+    source == "device" / the declared offset; that assertion was asserting the bug.
+    """
     respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(200, text=device_time)
     )
     client = make_client()
-    clock = await client.probe_clock()
-    assert clock.source == "device"
-    # localTime is -05:00, so DVR wall clock runs 5h behind UTC
+    clock = await client.probe_clock(
+        now_utc=datetime(2026, 7, 24, 18, 20, 29, tzinfo=timezone.utc)
+    )
+    assert clock.source == "measured"
     assert clock.offset == timedelta(hours=-5)
+    assert clock.drift == timedelta(0)  # clock face matches a whole-hour zone
     assert clock.to_dvr(datetime(2026, 7, 24, 18, 20, 29, tzinfo=timezone.utc)) == "2026-07-24T13:20:29Z"
     assert clock.to_utc(datetime(2026, 7, 24, 13, 20, 29)) == datetime(
         2026, 7, 24, 18, 20, 29, tzinfo=timezone.utc

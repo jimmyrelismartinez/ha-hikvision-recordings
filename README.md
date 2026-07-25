@@ -40,7 +40,41 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Verified DVR behaviour
 
-NOT YET RUN — `scripts/verify_dvr_contract.py` is written but has not been executed
-against the DVR (credentials were mid-rotation). Run it and fill this section in before
-implementing anything that depends on DVR time semantics, thumbnails, HTTP Range support,
-or search paging. Until then, treat those four behaviours as unverified.
+Verified live against **DVR-THD30B-81-HIK** on 2026-07-25.
+
+**Timestamps: the search endpoint is NOT UTC-honest.** `ContentMgmt/search` timestamps are
+the device's own local wall clock wearing a bogus `Z`. Measured head-to-head over the last
+40 real minutes, searching for recordings known to exist:
+
+| Offset applied to the query | ch101 | ch301 |
+|---|---|---|
+| `0` — treat `Z` as true UTC | 0 | 0 |
+| `-6h` — the UTC offset declared in `<localTime>` | 0 | 0 |
+| **measured against the device's own clock** | **1** | **4** |
+
+> ⚠️ A **wide** search window (say 6 h) numerically spans both frames, so it returns
+> matches under either hypothesis and looks like proof. Only a narrow window discriminates.
+> This trap produced two wrong conclusions before it was settled.
+
+The add-on therefore **measures** the offset (`device wall clock − our UTC`) rather than
+reading the declared one. The declared value reported `-06:00` (base CST) while the clock
+actually ran on DST (UTC-5) and was ~12 min adrift — trusting it put every query 47:54 off
+target and returned nothing. Measuring absorbs the DST error and the clock drift together,
+and is self-correcting: a firmware whose endpoint really is UTC-honest reports a wall clock
+equal to UTC, measures ~0, and gets no shift.
+
+`dvr_time_mode` options:
+- `auto` *(default, recommended)* — measure the offset against the device clock, re-measured
+  every 5 minutes so drift and DST transitions self-correct.
+- `utc` — apply no shift. For firmwares whose search endpoint really is UTC-honest.
+  **Verified wrong for this model** (returns zero matches).
+- `local` — apply the *host's* local UTC offset. Unverified against real hardware.
+- `declared` — apply the offset declared in `<localTime>`. This is what the code originally
+  did; wrong under DST on this model. Escape hatch only.
+
+`/api/health` reports `clock_offset_s` (what is applied) and `clock_drift_s` (how far the
+device's clock sits from a whole-hour zone — a device-clock health signal).
+
+**Still unverified** (deferred, needs a dedicated run of `scripts/verify_dvr_contract.py`):
+thumbnails in `searchMatchItem`, HTTP `Range` support on download, and the search paging
+field name.

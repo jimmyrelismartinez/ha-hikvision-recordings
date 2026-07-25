@@ -34,7 +34,7 @@ schema:
   dvr_username: str
   dvr_password: password
   dvr_use_https: bool
-  dvr_time_mode: list(auto|local|utc)
+  dvr_time_mode: list(auto|utc|local|declared)
   channels:
     - id: int
       name: str
