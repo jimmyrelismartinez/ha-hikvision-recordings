@@ -30,3 +30,10 @@ index over ISAPI and streams existing clips straight through to your browser.
   frontend + 401 on `/api/` at :9123).
 - Slug collision check + arch confirmation on the :9123 instance is PENDING — owner to verify
   in the HA UI before install (requires human login; not checked programmatically).
+
+## Verified DVR behaviour
+
+NOT YET RUN — `scripts/verify_dvr_contract.py` is written but has not been executed
+against the DVR (credentials were mid-rotation). Run it and fill this section in before
+implementing anything that depends on DVR time semantics, thumbnails, HTTP Range support,
+or search paging. Until then, treat those four behaviours as unverified.
