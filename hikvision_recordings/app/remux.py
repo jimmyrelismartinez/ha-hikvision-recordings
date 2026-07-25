@@ -19,9 +19,11 @@ READ_CHUNK = 65536
 # `frag_keyframe+empty_moov` puts a valid ftyp+moov at byte 0, so the browser can
 # start rendering while the DVR is still sending. Measured 2026-07-24: first byte
 # out 0.29 s after input started, on a real 32 MB clip.
-# Adding `default_base_is_moof` makes ffmpeg 6.1 fail with
+# `default_base_is_moof` is not a valid ffmpeg 6.1 movflag (the correctly spelled
+# flag is `default_base_moof`), so ffmpeg's option parser rejects it outright,
+# before muxing even starts — on ANY input, not just DVR clips — with
 #   "Could not write header (incorrect codec parameters ?): Invalid argument"
-# on this input. It is not an improvement. Leave the list exactly as-is.
+# It is not an improvement. Leave the list exactly as-is.
 # ────────────────────────────────────────────────────────────────────────────
 FFMPEG_ARGS = [
     "ffmpeg",

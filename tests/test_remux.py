@@ -1,3 +1,4 @@
+import asyncio
 import shutil
 import subprocess
 from pathlib import Path
@@ -78,6 +79,39 @@ async def test_client_disconnect_midstream_does_not_raise(mpeg_ps_bytes):
     stream = remux_to_fmp4(source())
     await stream.__anext__()
     await stream.aclose()  # must not raise
+
+
+async def test_client_disconnect_before_any_output_does_not_raise():
+    """Disconnecting before ffmpeg has produced a single byte must close cleanly.
+
+    This is the only scenario that actually exercises the placement of the
+    `produced == 0` guard relative to the try/finally in remux_to_fmp4: by the time
+    any chunk has been yielded, produced > 0 and the guard is unreachable regardless
+    of where it sits. `test_client_disconnect_midstream_does_not_raise` above always
+    has produced > 0 by the time it closes (the first chunk is already ~787 bytes),
+    so it cannot catch a regression here.
+    """
+
+    async def stalling_source():
+        # Never send ffmpeg any bytes and never finish, so ffmpeg's stdout.read()
+        # blocks and `produced` stays 0 for as long as this test needs it to.
+        await asyncio.sleep(3600)
+        yield b""  # pragma: no cover - unreachable within the test's lifetime
+
+    stream = remux_to_fmp4(stalling_source())
+    task = asyncio.ensure_future(stream.__anext__())
+    await asyncio.sleep(0.3)  # let ffmpeg spawn and block on stdout.read()
+    assert not task.done()  # confirms we're disconnecting before any output exists
+    task.cancel()
+
+    # A clean disconnect here must surface as CancelledError, not RemuxError. If the
+    # `produced == 0` check were inside the finally block, it would fire while
+    # CancelledError is propagating and replace it with RemuxError.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    # The generator is fully unwound now; a following aclose() must be a no-op.
+    await asyncio.wait_for(stream.aclose(), timeout=5)
 
 
 async def test_garbage_input_raises_remux_error():
