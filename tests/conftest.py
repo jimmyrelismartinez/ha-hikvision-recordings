@@ -1,3 +1,11 @@
+import os
+from pathlib import Path
+
+os.environ.setdefault(
+    "ADDON_WWW_DIR",
+    str(Path(__file__).resolve().parent.parent / "hikvision_recordings" / "www"),
+)
+
 import pytest
 
 SEARCH_OK = """<?xml version="1.0" encoding="UTF-8"?>

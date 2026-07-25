@@ -123,3 +123,25 @@ async def test_garbage_input_raises_remux_error():
     with pytest.raises(RemuxError):
         async for _ in remux_to_fmp4(source()):
             pass
+
+
+async def test_source_error_before_first_byte_propagates_its_own_type():
+    """A source that dies before producing any bytes must surface its own exception.
+
+    Regression: the feeder task's exception used to be swallowed by the cleanup
+    `finally` (`await feeder` under `except (asyncio.CancelledError, Exception): pass`),
+    so a DVR-side failure (e.g. DvrUnreachable) came out of remux_to_fmp4 as a generic
+    RemuxError — hiding the real cause and mapping to the wrong HTTP status upstream
+    (a 500 instead of a 502/401/503). Found while wiring app/main.py (Task 8).
+    """
+
+    class SourceBoom(Exception):
+        pass
+
+    async def dying_source():
+        raise SourceBoom("DVR is unreachable")
+        yield b""  # pragma: no cover - unreachable, keeps this an async generator
+
+    with pytest.raises(SourceBoom):
+        async for _ in remux_to_fmp4(dying_source()):
+            pass

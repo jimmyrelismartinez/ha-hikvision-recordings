@@ -68,6 +68,7 @@ async def remux_to_fmp4(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     feeder = asyncio.create_task(feed())
     produced = 0
     stderr = b""
+    source_error: BaseException | None = None
     try:
         while True:
             chunk = await process.stdout.read(READ_CHUNK)
@@ -84,8 +85,15 @@ async def remux_to_fmp4(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
         feeder.cancel()
         try:
             await feeder
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except asyncio.CancelledError:
             pass
+        except Exception as exc:  # noqa: BLE001 — stash it, re-raise below (never here)
+            # `source` (e.g. IsapiClient.stream_download) died before producing any
+            # bytes — its DvrError is the real cause, not a generic remux failure.
+            # Re-raising here would happen inside a `finally` that also runs under
+            # GeneratorExit, which is forbidden (see comment above), so we carry it
+            # to the normal-completion path below instead.
+            source_error = exc
         if process.returncode is None:
             process.kill()
         stderr = await process.stderr.read()
@@ -100,6 +108,8 @@ async def remux_to_fmp4(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
     # Normal-completion path: reached only when the loop above ended on its own, so
     # raising here is safe (unlike inside `finally`).
     if produced == 0:
+        if source_error is not None:
+            raise source_error
         detail = stderr.decode("utf-8", "replace").strip()[:500]
         LOG.error("ffmpeg produced no output: %s", detail)
         raise RemuxError(f"Couldn't prepare this clip for playback: {detail}")
