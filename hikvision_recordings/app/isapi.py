@@ -351,5 +351,7 @@ class IsapiClient:
             raise DvrUnreachable(
                 f"Lost the connection to the DVR at {self._config.dvr_host}."
             ) from exc
+        except httpx.HTTPError as exc:
+            raise DvrUnreachable(f"DVR request failed: {exc}") from exc
         finally:
             self._sem.release()
