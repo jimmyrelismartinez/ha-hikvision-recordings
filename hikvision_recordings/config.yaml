@@ -1,0 +1,43 @@
+name: DVR Recordings
+version: "0.1.0"
+slug: hikvision_recordings
+description: Browse, play and download existing recordings from a Hikvision DVR/NVR
+url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings
+arch:
+  - aarch64
+  - armv7
+  - amd64
+init: false
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:cctv
+panel_title: Recordings
+panel_admin: false
+# NOTE: no `ports:` key on purpose. Ingress-only means the container publishes
+# nothing on the host, so this add-on cannot collide with Scrypted or anything else.
+options:
+  dvr_host: ""
+  dvr_port: 80
+  dvr_username: ""
+  dvr_password: ""
+  dvr_use_https: false
+  dvr_time_mode: auto
+  channels:
+    - id: 101
+      name: Camera 1
+  max_results: 40
+  max_concurrent_downloads: 2
+  log_level: info
+schema:
+  dvr_host: str
+  dvr_port: port
+  dvr_username: str
+  dvr_password: password
+  dvr_use_https: bool
+  dvr_time_mode: list(auto|local|utc)
+  channels:
+    - id: int
+      name: str
+  max_results: int(1,200)
+  max_concurrent_downloads: int(1,4)
+  log_level: list(trace|debug|info|warning|error|fatal)
