@@ -19,6 +19,43 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Notes
 
+### Playback uses the substream; download gives you full quality
+
+Hikvision track numbering is `channel*100 + streamType` — 1 = mainstream,
+2 = substream, 3 = photo/snapshot (**not supported on this DVR**, `statusCode 4` /
+`notSupport`, which is why thumbnails decode a frame out of the video instead).
+
+Because the Range fix means a clip is fetched and remuxed *in full* before playback
+can start, the size of the file directly sets how long you wait. So **`/api/stream`
+plays the substream** (track `channel+1`, e.g. 102 for channel 101), which this DVR
+records independently at 960x480 CBR 3072k alongside the 1920x1080 CBR 6144k
+mainstream.
+
+**`/api/download` always fetches the mainstream** — full quality, unchanged. The
+recordings list and thumbnails also stay on the mainstream, so what you see in the
+list describes what Download will give you.
+
+Measured live on this DVR, same 36 s clip, end to end through the add-on
+(DVR fetch + remux + staging):
+
+| Endpoint | Track | Resolution | Size | Time |
+|---|---|---|---|---|
+| `/api/stream` | 102 (sub) | 960x480 | 13.8 MB | **30.8 s** |
+| `/api/download` | 101 (main) | 1920x1080 | 24.1 MB | 75.8 s |
+
+That is **~2.5x faster to start playing**, better than the size ratio alone predicts —
+the DVR appears to serve the substream more efficiently, not merely to send less.
+
+If a channel has no substream recording, or a particular window exists only on the
+mainstream, playback **falls back to the mainstream** and logs it. That fallback is a
+real safety net: some Hikvision devices record no substream at all.
+
+> ⚠️ **FIRMWARE QUIRK — do not "fix" this.** A search on trackID 102 returns results
+> whose `<trackID>` element says **101**. The label is wrong; the footage really is the
+> substream (confirmed with ffprobe: 960x480). The parser deliberately records the
+> channel that was *requested* and ignores that element, so nothing trusts the mislabel.
+> Do not add code that reads it.
+
 ### Thumbnails
 
 Each row in the results list shows a preview frame, lazy-loaded as the row scrolls

@@ -34,7 +34,7 @@ from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -244,13 +244,84 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
 
         return body()
 
+    # ── SUBSTREAM PLAYBACK ───────────────────────────────────────────────────
+    # Hikvision track numbering is channel*100 + streamType, where 1=main, 2=sub
+    # and 3=photo/snapshot. So the substream of configured channel 101 is 102.
+    # (streamType 3 is NOT supported on this DVR — statusCode 4 / notSupport —
+    # which is why thumbnails decode a frame out of the video instead.)
+    #
+    # Verified live on this DVR: the substream is independently recorded at
+    # 960x480 CBR 3072k vs the mainstream's 1920x1080 CBR 6144k. For the same 35 s
+    # clip, mainstream was 17.8 MB / 7.4 s to fetch; substream 10.5 MB / 3.4 s —
+    # better than the size ratio alone predicts, so the DVR serves it more
+    # efficiently too. Since the Range fix means a clip must be fully fetched and
+    # remuxed before playback can start, that roughly halves time-to-play.
+    #
+    # ⚠️ FIRMWARE QUIRK — DO NOT "FIX" THIS: a search on trackID 102 returns
+    # results whose <trackID> element says "101". The label is wrong; the footage
+    # really is the substream (confirmed with ffprobe: 960x480). parse_search_response
+    # deliberately records the channel we ASKED for and ignores that element, so
+    # nothing here trusts the mislabel. Do not add code that reads it.
+    SUBSTREAM_STREAM_TYPE_OFFSET = 1
+    # Main and sub recordings for the same event start/stop at slightly different
+    # instants, so widen the window before matching by overlap.
+    SUBSTREAM_WINDOW_PAD = timedelta(seconds=30)
+
+    async def _substream_for(recording: Recording) -> Recording | None:
+        """Find the substream counterpart of a mainstream clip, or None.
+
+        Returning None is a normal outcome, not a failure: a channel may have had
+        substream recording disabled, or this particular window may exist only on
+        the mainstream. The caller falls back to the mainstream so playback still
+        works — just slower.
+        """
+        sub_channel = recording.channel + SUBSTREAM_STREAM_TYPE_OFFSET
+        try:
+            candidates = await dvr.search(
+                sub_channel,
+                recording.start - SUBSTREAM_WINDOW_PAD,
+                recording.end + SUBSTREAM_WINDOW_PAD,
+            )
+        except DvrError as exc:
+            LOG.warning("substream search failed for channel %s (%s)", sub_channel, exc)
+            return None
+
+        # Pick the candidate overlapping the mainstream clip the most — a padded
+        # window can legitimately return the neighbouring event as well.
+        best: Recording | None = None
+        best_overlap = timedelta(0)
+        for candidate in candidates:
+            overlap = min(candidate.end, recording.end) - max(candidate.start, recording.start)
+            if overlap > best_overlap:
+                best, best_overlap = candidate, overlap
+        if best is None:
+            return None
+        try:
+            # Same SSRF check the registry applies to mainstream URIs.
+            registry.validate_uri(best.playback_uri)
+        except InvalidPlaybackUri:
+            LOG.warning("substream playbackURI failed validation; using mainstream")
+            return None
+        return best
+
     @app.get("/api/stream/{clip_id}")
     async def stream(clip_id: str, request: Request):
         recording = _lookup(clip_id)
+        # Play the substream: it is a smaller, independently recorded copy of the
+        # same event, and since the Range fix requires staging the whole clip
+        # before playback starts, halving the bytes roughly halves time-to-play.
+        # Download deliberately stays on the mainstream for full quality.
+        playback = await _substream_for(recording)
+        if playback is None:
+            LOG.info(
+                "no substream for channel %s at %s — falling back to the mainstream",
+                recording.channel, recording.start.isoformat(),
+            )
+            playback = recording
         # Staged to a RAM-backed file rather than streamed, so the response carries
         # Content-Length and answers Range — without which iOS refuses to play at
         # all. See _stage_clip() for the full reasoning and the cleanup guarantees.
-        path = await _stage_clip(recording, raw=False)
+        path = await _stage_clip(playback, raw=False)
         return FileResponse(
             path,
             media_type="video/mp4",

@@ -55,13 +55,18 @@ class ClipRegistry:
     def __len__(self) -> int:
         return len(self._entries)
 
-    def put(self, recording: Recording) -> str:
-        uri = recording.playback_uri
+    def validate_uri(self, uri: str) -> None:
+        """Raise InvalidPlaybackUri unless `uri` points at the configured DVR.
 
+        Public because a caller may need to USE a playbackURI without minting a
+        clip id for it — the substream lookup behind /api/stream does exactly
+        that. It runs the same check here rather than growing a second copy that
+        can drift away from this one.
+        """
         # Reject CR, LF, NUL, and other dangerous characters outright
         if any(c in uri for c in '\r\n\x00'):
             raise InvalidPlaybackUri(
-                f"playbackURI contains forbidden characters — refusing to store it"
+                "playbackURI contains forbidden characters — refusing to use it"
             )
 
         # Use fullmatch (not match) to validate the entire URI
@@ -79,6 +84,8 @@ class ClipRegistry:
                 f"set dvr_host to that IP"
             )
 
+    def put(self, recording: Recording) -> str:
+        self.validate_uri(recording.playback_uri)
         self._purge()
         clip_id = secrets.token_urlsafe(12)
         self._entries[clip_id] = _Entry(recording, time.monotonic() + self._ttl_s)
