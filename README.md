@@ -19,6 +19,37 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Notes
 
+### Thumbnails
+
+Each row in the results list shows a preview frame, lazy-loaded as the row scrolls
+into view.
+
+There is no ISAPI shortcut for this on this hardware. The search response carries
+no picture field, and the "channel + 300 = photo track" convention that HikLoad,
+hikvision-download-assistant and qb60/hikvision-downloader all use (trackID 103 for
+channel 101) is rejected by this firmware with `statusCode 4` / `notSupport`. So a
+preview is built the only way available: request the clip through the same
+`ContentMgmt/download` call the video path uses, read **only the first 1 MB**, and
+have ffmpeg decode a single frame straight from the raw MPEG-PS — no fragmented-MP4
+remux (that exists only to make a whole clip seekable) and no disk write. The JPEG
+is ~13 KB at 480px wide.
+
+> ⚠️ **The 1 MB read cap is measured, not guessed, and should not be trimmed.**
+> Truncating a real clip and decoding frame 1: at 128 KB ffmpeg *exits 0 and emits a
+> JPEG* whose top quarter is fine and whose remainder is smeared garbage. It does not
+> error. 256 KB was visually complete; 512 KB was byte-identical to 1 MB and 2 MB.
+> Because too-small a read fails silently, this can only be re-tuned by looking at the
+> image, never by watching return codes.
+
+**Concurrency caveat:** thumbnails go through the same DVR connection budget as
+playback and downloads (`max_concurrent_downloads`), deliberately — a 40-row list
+would otherwise swamp the device. That is also why the frontend fetches a preview
+only when its row scrolls into view. A busy DVR returns 503 for a thumbnail exactly
+as it does for a video request, and that row keeps its placeholder.
+
+Measured against the real DVR: **~0.4–0.6 s per thumbnail** end to end (three
+concurrent requests completed in 866 ms wall clock).
+
 ### Playback is staged; download is streamed
 
 **Inline playback (`/api/stream`) stages the clip to RAM first.** Verified live on

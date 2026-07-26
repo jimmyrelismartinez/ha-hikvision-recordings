@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -32,8 +32,9 @@ from .isapi import (
 )
 from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
+from .thumbnail import ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -341,6 +342,37 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-store",
             },
+        )
+
+    @app.get("/api/thumbnail/{clip_id}")
+    async def thumbnail(clip_id: str):
+        """One JPEG frame for a clip, for the results list.
+
+        Deliberately goes through dvr.stream_download() like playback and download
+        do, so thumbnails contend for the SAME max_concurrent_downloads budget
+        rather than opening an unlimited side channel to the DVR — a list of 40
+        rows could otherwise swamp it. A busy DVR therefore returns 503 here too,
+        by the same path as the video endpoints.
+        """
+        recording = _lookup(clip_id)
+        source = dvr.stream_download(recording.playback_uri)
+        try:
+            jpeg = await thumbnail_from_stream(source)
+        except DvrError as exc:
+            raise _http_error(exc) from exc
+        except ThumbnailError as exc:
+            # One unreadable clip must degrade to a placeholder on that row, not
+            # break the list — so this is a clean status, not a 500 traceback.
+            LOG.info("no preview for clip %s: %s", clip_id, exc)
+            raise HTTPException(
+                status_code=502, detail="No preview available for this clip."
+            ) from exc
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            # Clip ids live as long as the registry entry (1 h), so a browser may
+            # safely reuse the image for that long instead of re-hitting the DVR.
+            headers={"Cache-Control": "private, max-age=3600"},
         )
 
     @app.get("/")

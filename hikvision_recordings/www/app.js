@@ -89,6 +89,43 @@ function applyPreset(preset) {
   }
 }
 
+/* ── Lazy thumbnails ─────────────────────────────────────────────────────────
+ * Thumbnails share the DVR's max_concurrent_downloads budget with playback and
+ * downloads, so firing 40 requests the moment a search returns would swamp the
+ * device and make the list slow. Each row's image is fetched only once it
+ * actually scrolls into view, and only once (unobserved immediately after).
+ * A failed thumbnail leaves that one row on its placeholder — it must never
+ * break the rest of the list.
+ * ─────────────────────────────────────────────────────────────────────────── */
+const thumbObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver((entries, obs) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const img = entry.target;
+        obs.unobserve(img);
+        img.src = img.dataset.src;   // relative URL — see the ingress rule above
+      }
+    }, { rootMargin: '200px' })      // start a little before the row is visible
+  : null;
+
+function attachThumb(item, clip) {
+  const thumb = document.createElement('div');
+  thumb.className = 'clip-thumb';
+  const img = document.createElement('img');
+  img.alt = '';
+  img.loading = 'lazy';
+  img.dataset.src = `api/thumbnail/${clip.id}`;   // relative — no leading slash
+  img.addEventListener('load', () => thumb.classList.add('loaded'));
+  img.addEventListener('error', () => thumb.classList.add('failed'));
+  thumb.appendChild(img);
+  item.prepend(thumb);
+  if (thumbObserver) {
+    thumbObserver.observe(img);
+  } else {
+    img.src = img.dataset.src;       // no IntersectionObserver: just load it
+  }
+}
+
 function renderClip(clip) {
   const item = document.createElement('li');
   item.className = 'clip';
@@ -140,6 +177,7 @@ function renderClip(clip) {
   });
 
   item.append(header, body);
+  attachThumb(item, clip);
   return item;
 }
 
