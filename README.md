@@ -37,7 +37,12 @@ catchable error). Any failure at all — core won't load, DVR returns 503, ffmpe
 non-zero, output is empty — falls through to the compatibility path. There is no dead
 end; the worst case is the behaviour you already had.
 
-**Measured live on this DVR** (36 s clip, SD substream, Chrome, click → playable):
+> ℹ️ **The very first clip in a fresh browser is slower than this.** The wasm core is
+> ~32 MB and is downloaded once, then cached by the browser for every later clip. If
+> your first play feels slow, that is the core loading, not the feature failing.
+
+**Measured live on this DVR** (36 s clip, SD substream, Chrome, click → playable,
+wasm core already cached):
 
 | Path | DVR fetches | Time to playable | Seeking |
 |---|---|---|---|
@@ -77,6 +82,13 @@ ffmpeg.wasm is **vendored into the image at build time** (see the `Dockerfile`),
 fetched from a CDN — playing a clip never requires the container to have outbound
 internet. For a local checkout, run `scripts/fetch-ffmpeg-wasm.sh`; without it the
 frontend simply uses the compatibility path.
+
+> Also verified under a simulated Ingress path prefix
+> (`/api/hassio_ingress/<token>/`), because the UMD bundle loads its worker
+> (`814.ffmpeg.js`) by a path derived from its own script URL — a wrong prefix would
+> make `ffmpeg.load()` throw and silently pin every play to the compatibility path.
+> It resolves correctly, which is why `vendor/814.ffmpeg.js` must stay beside
+> `vendor/ffmpeg.js`.
 
 ### SD / HD
 
@@ -184,8 +196,17 @@ would otherwise swamp the device. That is also why the frontend fetches a previe
 only when its row scrolls into view. A busy DVR returns 503 for a thumbnail exactly
 as it does for a video request, and that row keeps its placeholder.
 
-Measured against the real DVR: **~0.4–0.6 s per thumbnail** end to end (three
-concurrent requests completed in 866 ms wall clock).
+Measured against the real DVR **after the 15 s change**: **~1.2–2.3 s per thumbnail**
+end to end, up from ~0.4–0.6 s when the preview was frame 0 and the read was capped at
+1 MB. That is the cost of the better frame.
+
+> ⚠️ **This makes list scrolling contend harder for the DVR.** Each preview now holds
+> one of `max_concurrent_downloads` (default 2) roughly 4x longer, so working through a
+> 40-row list keeps the DVR saturated for meaningfully longer — and a play started
+> during that window can get a 503 and drop to the compatibility path. If the list
+> feels sluggish, the lever is to point thumbnails at the substream (about half the
+> bytes); they deliberately use the mainstream today so the preview matches what
+> Download gives you.
 
 ### Playback is staged; download is streamed
 
