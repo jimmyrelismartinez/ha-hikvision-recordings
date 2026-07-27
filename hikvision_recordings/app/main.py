@@ -34,7 +34,7 @@ from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -495,9 +495,7 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         recording = _lookup(clip_id)
         source = dvr.stream_download(recording.playback_uri)
         try:
-            # Duration comes from the search result we already hold, so the seek
-            # target can be clamped for short clips without probing the DVR.
-            jpeg = await thumbnail_from_stream(source, duration_s=recording.duration_s)
+            jpeg = await thumbnail_from_stream(source)
         except DvrError as exc:
             raise _http_error(exc) from exc
         except ThumbnailError as exc:

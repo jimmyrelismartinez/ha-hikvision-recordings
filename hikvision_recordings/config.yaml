@@ -1,5 +1,5 @@
 name: DVR Recordings
-version: "0.1.4"
+version: "0.1.5"
 slug: hikvision_recordings
 description: Browse, play and download existing recordings from a Hikvision DVR/NVR
 url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings

@@ -160,24 +160,39 @@ ffmpeg decode a single frame straight from the raw MPEG-PS — no fragmented-MP4
 (that exists only to make a whole clip seekable) and no disk write. The JPEG is
 ~14 KB at 480px wide.
 
-**The frame comes from ~15 s in, not from the start.** A motion-triggered recording
-begins slightly *before* whatever triggered it, so frame 0 is usually an empty
-driveway or an empty room — a valid thumbnail that tells you nothing. Seeking in
-lands on the actual subject far more often.
+**The frame is the latest one the cheap read reaches — not frame 0, and not a fixed
+timestamp.** A motion-triggered recording begins slightly *before* whatever triggered
+it, so frame 0 is usually an empty driveway or an empty porch: a valid thumbnail that
+tells you nothing. So ffmpeg decodes every frame in the slice that was read and the
+**last complete one** is served.
 
-Short clips are clamped rather than assumed to reach 15 s (recordings as short as 1 s
-exist on this DVR):
+The budget caps the cost; the footage decides how far into the clip that reaches.
+Measured on a real 37 s mainstream clip (6144 kbps):
 
-| Clip duration | Preview taken at |
-|---|---|
-| ≥ 15 s | 15 s |
-| 2 – 15 s | the midpoint |
-| ≤ 2 s, or unknown | frame 0 |
+| Read | Frames decoded | Reaches |
+|---|---|---|
+| 1 MB | 11 | ~1.4 s |
+| **2 MB** (current) | **22** | **~2.7 s** |
+| 4 MB | 55 | ~5.5 s |
 
-If the seek still finds no frame — a clip shorter than its metadata claims, or a seek
-past the last keyframe — the frame is retried at offset 0 **using the bytes already
-read**, with no second DVR fetch. A short or odd clip therefore still gets a real
-picture instead of a placeholder.
+Substreams get this for free: at half the bitrate the same 2 MB reaches roughly twice
+as far in. That self-scaling is why this is a byte budget and not a time target.
+
+Nothing seeks, so nothing can land past the end of a short clip — if the slice yields
+only one frame, that frame is both the first and the last and is served as-is. A 1 s
+recording still gets a real picture.
+
+> **Reverted in v0.1.5: the fixed 15 s seek from v0.1.4.** Targeting an exact
+> timestamp meant reading enough bytes to *cover* it — ~13.5 MB at these bitrates —
+> and per-thumbnail time went ~0.5 s → 1.2–2.3 s. Because previews share the DVR's
+> `max_concurrent_downloads` budget (default 2), each one held a slot ~4x longer and
+> scrolling the list visibly stalled on rows still showing the placeholder. Taking
+> the last frame *within* the cheap read keeps the benefit and drops the cost:
+> measured 0.72–1.20 s per thumbnail, 1.86 s wall clock for three at once.
+>
+> Verified on real footage that this is not just frame 0 with extra steps: on an 8 s
+> porch clip the `t=0` frame is an empty porch and the served frame shows the person
+> at the door.
 
 > ⚠️ **The read budget is measured, not guessed.** Truncating a real clip and decoding
 > frame 1: at 128 KB ffmpeg *exits 0 and emits a JPEG* whose top quarter is fine and
@@ -185,10 +200,11 @@ picture instead of a placeholder.
 > 512 KB was byte-identical to 1 MB and 2 MB. Because too-small a read fails silently,
 > this can only be re-tuned by looking at the image, never by watching return codes.
 >
-> 1 MB remains the floor (the frame-0 case). Reaching 15 s needs proportionally more:
-> the budget is sized from the **mainstream** bitrate (6144 kbps, the worst case) plus
-> 2 MB of GOP headroom, i.e. ~13.5 MB for a full-length seek. That is a real increase
-> in DVR traffic per preview, and the trade the better frame costs.
+> That trap applies to the FIRST frame of a too-small read. The tail of the 2 MB slice
+> does not suffer from it — every frame decoded at 1/2/4 MB came out complete (JPEG
+> EOI present) and visually clean, because by 1 MB there are already whole GOPs to
+> decode. Incomplete trailing images are dropped rather than served, so a read cut
+> mid-picture cannot reach the browser.
 
 **Concurrency caveat:** thumbnails go through the same DVR connection budget as
 playback and downloads (`max_concurrent_downloads`), deliberately — a 40-row list
@@ -196,17 +212,14 @@ would otherwise swamp the device. That is also why the frontend fetches a previe
 only when its row scrolls into view. A busy DVR returns 503 for a thumbnail exactly
 as it does for a video request, and that row keeps its placeholder.
 
-Measured against the real DVR **after the 15 s change**: **~1.2–2.3 s per thumbnail**
-end to end, up from ~0.4–0.6 s when the preview was frame 0 and the read was capped at
-1 MB. That is the cost of the better frame.
+Measured against the real DVR: **~0.7–1.2 s per thumbnail** end to end, and 1.86 s
+wall clock for three concurrent requests (the third queues behind
+`max_concurrent_downloads: 2`). That is close to the ~0.4–0.6 s of the original
+frame-0 version, for a meaningfully better frame.
 
-> ⚠️ **This makes list scrolling contend harder for the DVR.** Each preview now holds
-> one of `max_concurrent_downloads` (default 2) roughly 4x longer, so working through a
-> 40-row list keeps the DVR saturated for meaningfully longer — and a play started
-> during that window can get a 503 and drop to the compatibility path. If the list
-> feels sluggish, the lever is to point thumbnails at the substream (about half the
-> bytes); they deliberately use the mainstream today so the preview matches what
-> Download gives you.
+> If the list ever does feel sluggish, the next lever is pointing thumbnails at the
+> substream — about half the bytes. They deliberately use the mainstream today so the
+> preview matches what Download gives you.
 
 ### Playback is staged; download is streamed
 
