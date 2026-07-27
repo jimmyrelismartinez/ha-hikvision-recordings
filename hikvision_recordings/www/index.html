@@ -39,6 +39,11 @@
   <p id="message" class="message" hidden></p>
   <ul id="results" class="results"></ul>
 
+  <!-- ffmpeg.wasm, vendored into the image at build time (see Dockerfile) — never
+       a CDN, so playback never needs outbound internet from the container.
+       If this file is absent (e.g. a local checkout that skipped scripts/fetch-ffmpeg-wasm.sh)
+       FFmpegWASM is simply undefined and app.js uses the server-side path instead. -->
+  <script src="vendor/ffmpeg.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

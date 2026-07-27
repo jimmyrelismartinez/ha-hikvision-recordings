@@ -126,6 +126,127 @@ function attachThumb(item, clip) {
   }
 }
 
+/* ── PLAYBACK: client-side remux, with the server path as the safety net ──────
+ * FAST PATH  — fetch api/stream-raw (the DVR's untouched MPEG-PS), remux it to MP4
+ *              in this browser with ffmpeg.wasm, play it from a blob URL. No ffmpeg
+ *              runs on the Pi, nothing is staged, and because the whole MP4 is in
+ *              memory the result is genuinely SEEKABLE — which the server path
+ *              cannot offer.
+ * SAFE PATH  — api/stream, i.e. the tmpfs-staged server-side remux from v0.1.1/
+ *              v0.1.3, untouched. Used automatically whenever the fast path is
+ *              unavailable or fails for ANY reason.
+ *
+ * NO SharedArrayBuffer, NO COOP/COEP. That requirement belonged to ffmpeg.wasm's
+ * multi-threaded core. Cross-origin isolation is inherited from the top-level
+ * document, and HA's frontend sends neither header, so inside the Ingress iframe
+ * crossOriginIsolated is always false and nothing this add-on serves can change
+ * that. The single-threaded core needs none of it — see the Dockerfile note.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+// Above this, the fast path is skipped: the raw clip plus its remuxed copy both
+// live in the wasm heap, and on a phone (HA Companion's WKWebView is the real
+// target) a large clip will exhaust memory rather than throw something catchable.
+// Compared against the MAINSTREAM size from the search result, which is the
+// conservative direction — an SD fetch is roughly half of it.
+const CLIENT_REMUX_MAX_BYTES = 64 * 1024 * 1024;
+
+const QUALITIES = ['sd', 'hd'];
+const DEFAULT_QUALITY = 'sd';
+
+let ffmpegPromise = null;
+
+function ffmpegAvailable() {
+  return typeof FFmpegWASM !== 'undefined' && typeof WebAssembly !== 'undefined';
+}
+
+async function getFFmpeg() {
+  if (!ffmpegPromise) {
+    ffmpegPromise = (async () => {
+      const { FFmpeg } = FFmpegWASM;
+      const ff = new FFmpeg();
+      // NOTE: classWorkerURL is deliberately NOT passed. In the UMD build that
+      // option forces `new Worker(..., {type:"module"})`, where importScripts()
+      // does not exist, so loading the UMD core falls into a dead code path and
+      // throws "Cannot find module". Omitting it yields a classic worker, and the
+      // worker file is then resolved relative to vendor/ffmpeg.js — which is why
+      // 814.ffmpeg.js must sit beside it.
+      await ff.load({
+        coreURL: new URL('vendor/ffmpeg-core.js', document.baseURI).href,
+        wasmURL: new URL('vendor/ffmpeg-core.wasm', document.baseURI).href,
+      });
+      return ff;
+    })().catch((err) => {
+      ffmpegPromise = null;      // let a later clip retry rather than poisoning them all
+      throw err;
+    });
+  }
+  return ffmpegPromise;
+}
+
+// One wasm instance with one filesystem: two clips remuxing at once would collide.
+// Serialise them instead of instantiating a second 32 MB core.
+let remuxChain = Promise.resolve();
+function serialise(task) {
+  const run = remuxChain.then(task, task);
+  remuxChain = run.catch(() => {});
+  return run;
+}
+
+async function remuxInBrowser(clip, quality) {
+  const ff = await getFFmpeg();
+  const response = await fetch(`api/stream-raw/${clip.id}?quality=${quality}`);
+  if (!response.ok) {
+    let detail = `the add-on returned HTTP ${response.status}`;
+    try { detail = (await response.json()).detail || detail; } catch (err) { /* not JSON */ }
+    throw new Error(detail);
+  }
+  const raw = new Uint8Array(await response.arrayBuffer());
+  if (!raw.length) throw new Error('the DVR returned an empty clip');
+
+  // Unique names: MEMFS is shared across every clip this session.
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const input = `in-${stamp}.ps`;
+  const output = `out-${stamp}.mp4`;
+  try {
+    await ff.writeFile(input, raw);
+    // The same stream copy the server does — no re-encode. Plain MP4 rather than
+    // the server's fragmented one: the whole file is already here, so a normal
+    // moov gives the browser full seeking.
+    const code = await ff.exec(['-hide_banner', '-loglevel', 'error',
+                                '-i', input, '-c', 'copy', '-f', 'mp4', output]);
+    if (code !== 0) throw new Error(`ffmpeg.wasm exited ${code}`);
+    const data = await ff.readFile(output);
+    if (!data || !data.length) throw new Error('ffmpeg.wasm produced no output');
+    return new Blob([data.buffer], { type: 'video/mp4' });
+  } finally {
+    // Always reclaim the wasm heap, even on failure — otherwise a few large clips
+    // exhaust it and every later remux fails for an unrelated reason.
+    for (const path of [input, output]) {
+      try { await ff.deleteFile(path); } catch (err) { /* never existed */ }
+    }
+  }
+}
+
+/* Why the fast path was skipped, in words Ramon can read off a screenshot. */
+function clientRemuxBlocker(clip) {
+  if (!ffmpegAvailable()) return 'ffmpeg.wasm not loaded in this browser';
+  if (clip.size_bytes > CLIENT_REMUX_MAX_BYTES) {
+    return `clip is ${formatSize(clip.size_bytes)}, over the ${formatSize(CLIENT_REMUX_MAX_BYTES)} in-browser limit`;
+  }
+  return null;
+}
+
+function setMode(badge, mode, detail) {
+  badge.dataset.mode = mode;
+  badge.textContent = {
+    working: 'Remuxing in browser…',
+    fast: 'Fast · browser remux',
+    compat: 'Compatibility · server remux',
+    failed: 'Playback failed',
+  }[mode] || mode;
+  badge.title = detail || '';
+}
+
 function renderClip(clip) {
   const item = document.createElement('li');
   item.className = 'clip';
@@ -158,27 +279,99 @@ function renderClip(clip) {
     body.hidden = !body.hidden;
     if (opening && !body.dataset.loaded) {
       body.dataset.loaded = '1';
-      const video = document.createElement('video');
-      video.controls = true;
-      video.playsInline = true;
-      video.preload = 'none';
-      video.src = `api/stream/${clip.id}`;          // relative — see rule at top
-      const hint = document.createElement('p');
-      hint.className = 'hint';
-      hint.textContent = "Seeking isn't supported for live DVR playback — download the clip to scrub.";
-      const download = document.createElement('a');
-      download.className = 'download';
-      download.href = `api/download/${clip.id}`;    // relative — see rule at top
-      download.textContent = 'Download';
-      download.setAttribute('download', '');
-      body.append(video, hint, download);
-      video.play().catch(() => { /* iOS wants a second tap; the controls handle it */ });
+      buildPlayer(clip, body);
     }
   });
 
   item.append(header, body);
   attachThumb(item, clip);
   return item;
+}
+
+function buildPlayer(clip, body) {
+  let quality = DEFAULT_QUALITY;
+  let blobUrl = null;
+
+  const video = document.createElement('video');
+  video.controls = true;
+  video.playsInline = true;
+  video.preload = 'none';
+
+  const bar = document.createElement('div');
+  bar.className = 'clip-controls';
+
+  const picker = document.createElement('div');
+  picker.className = 'quality';
+  const buttons = new Map();
+  for (const q of QUALITIES) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = q.toUpperCase();
+    button.title = q === 'sd'
+      ? 'Substream — smaller and faster to load'
+      : 'Mainstream — full resolution';
+    button.addEventListener('click', () => {
+      if (quality === q) return;
+      quality = q;
+      for (const [key, el] of buttons) el.classList.toggle('on', key === quality);
+      play();
+    });
+    buttons.set(q, button);
+    picker.appendChild(button);
+  }
+  buttons.get(quality).classList.add('on');
+
+  const badge = document.createElement('span');
+  badge.className = 'mode-badge';
+
+  bar.append(picker, badge);
+
+  const hint = document.createElement('p');
+  hint.className = 'hint';
+
+  const download = document.createElement('a');
+  download.className = 'download';
+  // Download is always full-quality mainstream — deliberately NOT quality-aware.
+  download.href = `api/download/${clip.id}`;      // relative — see rule at top
+  download.textContent = 'Download';
+  download.setAttribute('download', '');
+
+  body.append(bar, video, hint, download);
+
+  function useServerPath(reason) {
+    setMode(badge, 'compat', reason);
+    hint.textContent = "Seeking isn't supported on this path — download the clip to scrub.";
+    video.src = `api/stream/${clip.id}?quality=${quality}`;   // relative — see rule at top
+    video.play().catch(() => { /* iOS wants a second tap; the controls handle it */ });
+  }
+
+  async function play() {
+    if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+
+    const blocker = clientRemuxBlocker(clip);
+    if (blocker) {
+      // Never going to work here — don't load a 32 MB core to find that out, and
+      // don't show an error for something that was never attempted.
+      useServerPath(blocker);
+      return;
+    }
+
+    setMode(badge, 'working', 'fetching raw clip and remuxing with ffmpeg.wasm');
+    try {
+      const blob = await serialise(() => remuxInBrowser(clip, quality));
+      blobUrl = URL.createObjectURL(blob);
+      video.src = blobUrl;
+      setMode(badge, 'fast', 'remuxed in-browser by ffmpeg.wasm — seeking works');
+      hint.textContent = '';
+      video.play().catch(() => { /* iOS wants a second tap */ });
+    } catch (err) {
+      // ANY client-side failure falls through to the path that already works.
+      console.warn('client remux failed; using the server path', err);
+      useServerPath(`client remux failed: ${err && err.message ? err.message : err}`);
+    }
+  }
+
+  play();
 }
 
 form.addEventListener('submit', async (event) => {

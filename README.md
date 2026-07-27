@@ -19,7 +19,84 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Notes
 
-### Playback uses the substream; download gives you full quality
+### Two playback paths: browser remux first, server remux as the fallback
+
+Playing a clip tries the **fast path** first and silently drops to the **compatibility
+path** if anything is missing or goes wrong. A small badge next to the player says
+which one actually ran, so you can tell them apart at a glance (or in a screenshot):
+
+| Badge | Path | What happens |
+|---|---|---|
+| **Fast · browser remux** | `/api/stream-raw` | The add-on proxies the DVR's raw MPEG-PS through untouched — no ffmpeg on the server, nothing staged — and **ffmpeg.wasm remuxes it to MP4 in your browser**, played from a blob URL. |
+| **Compatibility · server remux** | `/api/stream` | The original path: fetch, remux with ffmpeg on the host, stage to RAM, serve with `Content-Length` + Range. Unchanged from v0.1.1/v0.1.3. |
+
+The fast path is skipped **before** anything is downloaded when it could not work:
+ffmpeg.wasm missing, or a clip larger than 64 MB (the raw clip and its remuxed copy
+both sit in the wasm heap, and a phone will run out of memory rather than raise a
+catchable error). Any failure at all — core won't load, DVR returns 503, ffmpeg exits
+non-zero, output is empty — falls through to the compatibility path. There is no dead
+end; the worst case is the behaviour you already had.
+
+**Measured live on this DVR** (36 s clip, SD substream, Chrome, click → playable):
+
+| Path | DVR fetches | Time to playable | Seeking |
+|---|---|---|---|
+| Browser remux | 1 | **1.8 – 2.8 s** | ✅ full clip |
+| Server remux | 20 | 32.8 – 35.6 s | ❌ |
+
+The win is **not** that the browser remuxes faster than the host — a single server
+staging cycle is only ~1.5 s, and remuxing is a `-c copy` stream copy either way. The
+win is the number of DVR fetches. `/api/stream` stages a fresh copy **per HTTP
+request**, and Chrome answers one `<video>` with ~20 Range requests, so the entire
+clip is re-fetched from the DVR and re-remuxed 20 times. The browser path fetches it
+exactly once. Because the finished MP4 is fully in memory, it is also genuinely
+**seekable**, which the staged path is not.
+
+> ℹ️ That 20x re-fetch is pre-existing behaviour of the compatibility path, not
+> something this version introduced. Caching a staged clip across Range requests
+> would be the obvious next improvement, but the fallback is deliberately left
+> untouched here so it stays a known-good safety net.
+
+#### No `SharedArrayBuffer`, no COOP/COEP headers — and that is deliberate
+
+ffmpeg.wasm's **multi-threaded** core (`@ffmpeg/core-mt`) needs `SharedArrayBuffer`,
+which needs the page to be cross-origin isolated, which needs
+`Cross-Origin-Opener-Policy` + `Cross-Origin-Embedder-Policy`. **Under Home Assistant
+Ingress that is impossible.** Cross-origin isolation is inherited from the top-level
+document, HA's own frontend sends neither header (verified live), and the add-on panel
+is an iframe inside it — so no header this add-on sets can make `crossOriginIsolated`
+true. Forcing COEP onto HA's frontend would break unrelated parts of HA.
+
+This add-on therefore ships the **single-threaded** core (`@ffmpeg/core`), which needs
+none of that. Verified 2026-07-27 with `crossOriginIsolated === false` and
+`SharedArrayBuffer` undefined: a real 3.7 MB DVR clip loaded the core in 243 ms and
+remuxed in 365 ms. Stream copying is I/O, not parallel compute, so threads buy nothing
+here anyway. **Do not "upgrade" this to `core-mt`.**
+
+ffmpeg.wasm is **vendored into the image at build time** (see the `Dockerfile`), never
+fetched from a CDN — playing a clip never requires the container to have outbound
+internet. For a local checkout, run `scripts/fetch-ffmpeg-wasm.sh`; without it the
+frontend simply uses the compatibility path.
+
+### SD / HD
+
+Each clip has an **SD / HD** toggle next to the player, defaulting to SD:
+
+- **SD** — the substream (track `channel+1`), roughly half the bytes and the faster choice.
+- **HD** — the mainstream (track `channel`), full 1920x1080.
+
+Both `/api/stream` and `/api/stream-raw` accept `?quality=sd|hd`, so either playback
+path can serve either quality. Picking HD skips the substream lookup entirely rather
+than searching for a result it would discard.
+
+**`/api/download` is not quality-aware** — it always gives you the full mainstream,
+whatever you picked for playback.
+
+If you choose SD on a channel that has no substream recorded for that window, playback
+**falls back to the mainstream and logs it**, exactly as before — asking for SD is a
+speed preference, not a precondition.
+
+### Playback uses the substream by default; download gives you full quality
 
 Hikvision track numbering is `channel*100 + streamType` — 1 = mainstream,
 2 = substream, 3 = photo/snapshot (**not supported on this DVR**, `statusCode 4` /
@@ -66,17 +143,40 @@ no picture field, and the "channel + 300 = photo track" convention that HikLoad,
 hikvision-download-assistant and qb60/hikvision-downloader all use (trackID 103 for
 channel 101) is rejected by this firmware with `statusCode 4` / `notSupport`. So a
 preview is built the only way available: request the clip through the same
-`ContentMgmt/download` call the video path uses, read **only the first 1 MB**, and
-have ffmpeg decode a single frame straight from the raw MPEG-PS — no fragmented-MP4
-remux (that exists only to make a whole clip seekable) and no disk write. The JPEG
-is ~13 KB at 480px wide.
+`ContentMgmt/download` call the video path uses, read a bounded slice of it, and have
+ffmpeg decode a single frame straight from the raw MPEG-PS — no fragmented-MP4 remux
+(that exists only to make a whole clip seekable) and no disk write. The JPEG is
+~14 KB at 480px wide.
 
-> ⚠️ **The 1 MB read cap is measured, not guessed, and should not be trimmed.**
-> Truncating a real clip and decoding frame 1: at 128 KB ffmpeg *exits 0 and emits a
-> JPEG* whose top quarter is fine and whose remainder is smeared garbage. It does not
-> error. 256 KB was visually complete; 512 KB was byte-identical to 1 MB and 2 MB.
-> Because too-small a read fails silently, this can only be re-tuned by looking at the
-> image, never by watching return codes.
+**The frame comes from ~15 s in, not from the start.** A motion-triggered recording
+begins slightly *before* whatever triggered it, so frame 0 is usually an empty
+driveway or an empty room — a valid thumbnail that tells you nothing. Seeking in
+lands on the actual subject far more often.
+
+Short clips are clamped rather than assumed to reach 15 s (recordings as short as 1 s
+exist on this DVR):
+
+| Clip duration | Preview taken at |
+|---|---|
+| ≥ 15 s | 15 s |
+| 2 – 15 s | the midpoint |
+| ≤ 2 s, or unknown | frame 0 |
+
+If the seek still finds no frame — a clip shorter than its metadata claims, or a seek
+past the last keyframe — the frame is retried at offset 0 **using the bytes already
+read**, with no second DVR fetch. A short or odd clip therefore still gets a real
+picture instead of a placeholder.
+
+> ⚠️ **The read budget is measured, not guessed.** Truncating a real clip and decoding
+> frame 1: at 128 KB ffmpeg *exits 0 and emits a JPEG* whose top quarter is fine and
+> whose remainder is smeared garbage. It does not error. 256 KB was visually complete;
+> 512 KB was byte-identical to 1 MB and 2 MB. Because too-small a read fails silently,
+> this can only be re-tuned by looking at the image, never by watching return codes.
+>
+> 1 MB remains the floor (the frame-0 case). Reaching 15 s needs proportionally more:
+> the budget is sized from the **mainstream** bitrate (6144 kbps, the worst case) plus
+> 2 MB of GOP headroom, i.e. ~13.5 MB for a full-length seek. That is a real increase
+> in DVR traffic per preview, and the trade the better frame costs.
 
 **Concurrency caveat:** thumbnails go through the same DVR connection budget as
 playback and downloads (`max_concurrent_downloads`), deliberately — a 40-row list

@@ -24,8 +24,11 @@ from hikvision_recordings.app.isapi import DvrBusy, DvrUnreachable, Recording
 from hikvision_recordings.app.main import create_app
 from hikvision_recordings.app.thumbnail import (
     THUMB_MAX_BYTES,
+    THUMB_TARGET_S,
     ThumbnailError,
+    _max_bytes_for,
     thumbnail_from_stream,
+    thumbnail_offset_for,
 )
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -125,17 +128,94 @@ def test_returns_a_real_decodable_jpeg(mpeg_ps_bytes, tmp_path):
     assert int(height) > 0
 
 
-def test_reads_only_a_slice_not_the_whole_clip(mpeg_ps_bytes):
-    """The whole point: a preview must not pull a 20-60 MB clip off the DVR."""
-    padded = mpeg_ps_bytes + b"\0" * (4 * 1024 * 1024)
+def test_reads_only_a_bounded_slice_not_the_whole_clip(mpeg_ps_bytes):
+    """A preview must not pull a 20-60 MB clip off the DVR.
+
+    The budget is no longer a flat 1 MB. Since the preview frame comes from ~15 s
+    in rather than frame 0, reaching it needs proportionally more bytes — see the
+    bitrate reasoning in thumbnail.py. What must still hold is that the read is
+    BOUNDED by that budget and stops well short of a whole clip.
+    """
+    budget = _max_bytes_for(thumbnail_offset_for(RECORDING.duration_s))
+    padded = mpeg_ps_bytes + b"\0" * (budget + 8 * 1024 * 1024)
     fake = FakeClient(padded, chunk=65536)
     with _client(fake) as client:
         response = client.get(f"/api/thumbnail/{_clip_id(client)}")
     assert response.status_code == 200
-    assert fake.bytes_served <= THUMB_MAX_BYTES + fake.chunk, (
-        f"read {fake.bytes_served} bytes; the cap is {THUMB_MAX_BYTES}"
+    assert fake.bytes_served <= budget + fake.chunk, (
+        f"read {fake.bytes_served} bytes; the budget is {budget}"
     )
     assert fake.bytes_served < len(padded), "read the entire clip"
+
+
+# ── Preview frame timing (v0.1.4) ────────────────────────────────────────────
+# Frame 0 of a motion-triggered recording is usually the empty scene just before
+# the event, so the preview is taken ~15 s in. Clips as short as 1 s exist on this
+# DVR, so the clamp and the fallback are what keep that from becoming a new
+# failure mode.
+
+def test_long_clip_seeks_to_the_target_time():
+    assert thumbnail_offset_for(60) == THUMB_TARGET_S
+    assert thumbnail_offset_for(15) == THUMB_TARGET_S
+
+
+@pytest.mark.parametrize("duration_s", [3, 5, 10, 14])
+def test_short_clip_is_clamped_to_inside_the_clip(duration_s):
+    offset = thumbnail_offset_for(duration_s)
+    assert 0 < offset < duration_s, "seek target must land inside the clip"
+
+
+@pytest.mark.parametrize("duration_s", [0, 1, 2, None])
+def test_very_short_or_unknown_duration_falls_back_to_frame_zero(duration_s):
+    """Seeking fractions of a second buys nothing and risks passing the only keyframe."""
+    assert thumbnail_offset_for(duration_s) == 0.0
+
+
+def test_budget_scales_with_the_seek_target_but_never_below_the_floor():
+    assert _max_bytes_for(0.0) == THUMB_MAX_BYTES
+    assert _max_bytes_for(THUMB_TARGET_S) > _max_bytes_for(1.0) > THUMB_MAX_BYTES - 1
+
+
+async def test_one_second_clip_still_yields_a_real_thumbnail(tmp_path_factory):
+    """A 1 s recording — real ones exist on this DVR — must still get a picture.
+
+    This is the regression Ramon called out: seeking 15 s into a 1 s clip must not
+    turn a working thumbnail into an error.
+    """
+    out = tmp_path_factory.mktemp("short") / "short.ps"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=duration=1:size=640x360:rate=10",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", "-f", "mpeg", str(out)],
+        check=True,
+    )
+    payload = out.read_bytes()
+
+    async def source():
+        for i in range(0, len(payload), 65536):
+            yield payload[i : i + 65536]
+
+    jpeg = await thumbnail_from_stream(source(), duration_s=1)
+    assert jpeg.startswith(b"\xff\xd8\xff"), "a 1 s clip produced no thumbnail"
+
+
+async def test_unreachable_seek_target_retries_at_frame_zero(mpeg_ps_bytes):
+    """If the seek finds no frame, the SAME bytes are retried at offset 0.
+
+    The fixture clip is 2 s long but is described here as 60 s, so the 15 s seek
+    target is past its end — exactly the mismatch a wrong-duration search result
+    would produce. It must still return a picture, without a second DVR fetch.
+    """
+    reads = {"n": 0}
+
+    async def source():
+        reads["n"] += 1
+        for i in range(0, len(mpeg_ps_bytes), 65536):
+            yield mpeg_ps_bytes[i : i + 65536]
+
+    jpeg = await thumbnail_from_stream(source(), duration_s=60)
+    assert jpeg.startswith(b"\xff\xd8\xff"), "no fallback frame was produced"
+    assert reads["n"] == 1, "retry re-fetched from the DVR instead of reusing the bytes"
 
 
 def test_uses_the_shared_dvr_connection_budget(mpeg_ps_bytes):

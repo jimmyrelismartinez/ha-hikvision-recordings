@@ -34,7 +34,7 @@ from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -71,6 +71,22 @@ def _sweep_stale_stages() -> None:
                 continue
     except OSError:  # pragma: no cover - staging dir missing
         pass
+
+# Playback quality the caller may ask for. "sd" = the DVR's independently recorded
+# substream, "hd" = the mainstream. SD is the default because it is roughly half the
+# bytes and therefore materially faster to fetch on both playback paths.
+# NOTE: /api/download is deliberately NOT quality-aware — it always serves the full
+# mainstream, whatever the user picked for playback.
+QUALITIES = ("sd", "hd")
+DEFAULT_QUALITY = "sd"
+
+
+def _check_quality(quality: str) -> None:
+    if quality not in QUALITIES:
+        raise HTTPException(
+            status_code=400, detail="quality must be 'sd' or 'hd'."
+        )
+
 
 ERROR_STATUS = {
     DvrAuthError: 401,
@@ -304,20 +320,44 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             return None
         return best
 
-    @app.get("/api/stream/{clip_id}")
-    async def stream(clip_id: str, request: Request):
-        recording = _lookup(clip_id)
-        # Play the substream: it is a smaller, independently recorded copy of the
-        # same event, and since the Range fix requires staging the whole clip
-        # before playback starts, halving the bytes roughly halves time-to-play.
-        # Download deliberately stays on the mainstream for full quality.
+    async def _playback_for_quality(recording: Recording, quality: str) -> Recording:
+        """Resolve which recording to actually fetch for the requested quality.
+
+        `sd` -> the independently recorded substream (smaller, faster). `hd` -> the
+        mainstream exactly as it came back from the search.
+
+        HD deliberately does NOT run the substream lookup at all: it already holds
+        the recording it wants, so a second DVR search would only add latency and
+        consume search capacity for a result it would discard.
+
+        SD keeps the v0.1.3 behaviour unchanged, fallback included: when a channel
+        has no substream recorded for this window, _substream_for() returns None and
+        we quietly serve the mainstream instead. That is a normal outcome with a log
+        line, never an error — the user asked for SD as a speed preference, not as a
+        precondition, so a channel without one must still play.
+        """
+        if quality == "hd":
+            return recording
         playback = await _substream_for(recording)
         if playback is None:
             LOG.info(
                 "no substream for channel %s at %s — falling back to the mainstream",
                 recording.channel, recording.start.isoformat(),
             )
-            playback = recording
+            return recording
+        return playback
+
+    @app.get("/api/stream/{clip_id}")
+    async def stream(clip_id: str, request: Request, quality: str = Query(DEFAULT_QUALITY)):
+        """Server-side path: fetch, remux to MP4 here, stage, serve with Range.
+
+        This is the COMPATIBILITY path and the automatic fallback for the client-side
+        remux in app.js. It is deliberately untouched apart from gaining `quality` —
+        it is the safety net, so it must keep working exactly as it did in v0.1.3.
+        """
+        _check_quality(quality)
+        recording = _lookup(clip_id)
+        playback = await _playback_for_quality(recording, quality)
         # Staged to a RAM-backed file rather than streamed, so the response carries
         # Content-Length and answers Range — without which iOS refuses to play at
         # all. See _stage_clip() for the full reasoning and the cleanup guarantees.
@@ -327,6 +367,33 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             media_type="video/mp4",
             headers={"Cache-Control": "no-store"},
             background=BackgroundTask(_discard_stage, path),
+        )
+
+    @app.get("/api/stream-raw/{clip_id}")
+    async def stream_raw(clip_id: str, request: Request, quality: str = Query(DEFAULT_QUALITY)):
+        """Raw DVR bytes, unstaged and unmuxed — the client remuxes these itself.
+
+        No ffmpeg runs on the server for this path. The bytes are proxied straight
+        through as they arrive, which is what the ORIGINAL pre-Range /api/stream did,
+        and is why this is faster: no full-clip staging before the first byte, and no
+        server-side transcode at all.
+
+        The response is Hikvision MPEG-PS, NOT playable MP4 — hence video/mpeg, the
+        same type /api/download?raw=1 already uses. Nothing but ffmpeg.wasm should
+        point a <video> at this.
+
+        Concurrency is not special-cased here: it goes through dvr.stream_download()
+        like every other DVR-fetching endpoint, so it competes for the same
+        max_concurrent_downloads budget and surfaces the same 503 when saturated.
+        """
+        _check_quality(quality)
+        recording = _lookup(clip_id)
+        playback = await _playback_for_quality(recording, quality)
+        body = await _open_video_stream(playback, raw=True, request=request)
+        return StreamingResponse(
+            body,
+            media_type="video/mpeg",
+            headers={"Cache-Control": "no-store"},
         )
 
     async def _stage_clip(recording: Recording, raw: bool) -> Path:
@@ -428,7 +495,9 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         recording = _lookup(clip_id)
         source = dvr.stream_download(recording.playback_uri)
         try:
-            jpeg = await thumbnail_from_stream(source)
+            # Duration comes from the search result we already hold, so the seek
+            # target can be clamped for short clips without probing the DVR.
+            jpeg = await thumbnail_from_stream(source, duration_s=recording.duration_s)
         except DvrError as exc:
             raise _http_error(exc) from exc
         except ThumbnailError as exc:

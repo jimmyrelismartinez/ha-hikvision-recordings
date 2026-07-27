@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>app.js playback fallback tests</title></head>
+<body>
+<!--
+  Exercises the REAL hikvision_recordings/www/app.js — not a copy — against stubbed
+  ffmpeg.wasm and fetch. What is being pinned:
+
+    * the client path is skipped entirely (no raw fetch, no 32 MB core load) when
+      it could never work: ffmpeg.wasm absent, or the clip too big for the heap
+    * ANY client-side failure — load, HTTP, non-zero exit, empty output — lands on
+      the existing server-side /api/stream, never on a dead player
+    * the badge reports the path that actually ran, since that is the only way to
+      tell them apart from a screenshot
+    * the SD/HD choice reaches both paths, including the fallback
+
+  Run via tests/frontend/run.py, which serves the repo and drives a real browser.
+-->
+<pre id="log"></pre>
+
+<!-- The DOM app.js binds to at load. Ids must match www/index.html. -->
+<form id="search-form">
+  <select id="channel"></select>
+  <input type="date" id="date"><input type="time" id="from"><input type="time" id="to">
+  <button type="submit" id="search-button"></button>
+</form>
+<p id="message"></p><span id="status"></span><ul id="results"></ul>
+<div id="cases"></div>
+
+<script>
+// ── stubs, installed before app.js runs ──────────────────────────────────────
+window.__fetches = [];
+window.__nextRawResponse = null;
+
+window.fetch = async (url) => {
+  window.__fetches.push(String(url));
+  if (String(url).startsWith('api/channels')) {
+    return { ok: true, json: async () => [{ id: 101, name: 'DriveWay1' }] };
+  }
+  if (String(url).startsWith('api/health')) {
+    return { ok: true, json: async () => ({ dvr: 'ok' }) };
+  }
+  if (String(url).startsWith('api/stream-raw')) {
+    if (window.__nextRawResponse) return window.__nextRawResponse();
+    return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
+  }
+  throw new Error('unexpected fetch ' + url);
+};
+
+// A stub whose behaviour each case sets. Absent entirely for the "no wasm" case.
+function installFFmpeg(behaviour) {
+  window.FFmpegWASM = {
+    FFmpeg: class {
+      async load() { if (behaviour.loadThrows) throw new Error('core failed to load'); }
+      async writeFile() {}
+      async deleteFile() {}
+      async exec() { return behaviour.exitCode === undefined ? 0 : behaviour.exitCode; }
+      async readFile() {
+        return behaviour.output === undefined ? new Uint8Array([0, 0, 0, 1]) : behaviour.output;
+      }
+    },
+  };
+}
+</script>
+
+<script src="/hikvision_recordings/www/app.js"></script>
+
+<script>
+const out = document.getElementById('log');
+// NOTE: not `results` — app.js already binds that at top level, and a second
+// top-level declaration of the same name is a SyntaxError that kills this script.
+const checks = [];
+function check(name, cond, detail) {
+  checks.push({ name, pass: !!cond, detail: detail || '' });
+  out.textContent += `${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}\n`;
+}
+
+const SMALL_CLIP = { id: 'abc123', size_bytes: 4 * 1024 * 1024, duration_s: 35 };
+const HUGE_CLIP = { id: 'big999', size_bytes: 512 * 1024 * 1024, duration_s: 900 };
+
+async function runCase({ clip, behaviour, raw, quality }) {
+  window.__fetches = [];
+  window.__nextRawResponse = raw || null;
+  ffmpegPromise = null;                       // drop any cached core between cases
+  if (behaviour === null) delete window.FFmpegWASM;
+  else installFFmpeg(behaviour || {});
+
+  const body = document.createElement('div');
+  document.getElementById('cases').appendChild(body);
+  buildPlayer(clip, body);
+
+  const badge = body.querySelector('.mode-badge');
+  const video = body.querySelector('video');
+  for (let i = 0; i < 200 && (!badge.dataset.mode || badge.dataset.mode === 'working'); i++) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  if (quality) {
+    window.__fetches = [];
+    [...body.querySelectorAll('.quality button')]
+      .find((b) => b.textContent === quality.toUpperCase()).click();
+    for (let i = 0; i < 200 && badge.dataset.mode === 'working'; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+  return {
+    mode: badge.dataset.mode,
+    title: badge.title,
+    label: badge.textContent,
+    src: video.getAttribute('src') || '',
+    fetches: window.__fetches.slice(),
+  };
+}
+
+(async function () {
+  try {
+    // 1. ffmpeg.wasm not present at all -> never attempt, never error.
+    let r = await runCase({ clip: SMALL_CLIP, behaviour: null });
+    check('no ffmpeg.wasm -> compatibility mode', r.mode === 'compat', r.mode);
+    check('no ffmpeg.wasm -> plays via api/stream', r.src.startsWith('api/stream/'), r.src);
+    check('no ffmpeg.wasm -> never fetched raw bytes',
+          !r.fetches.some((u) => u.startsWith('api/stream-raw')), r.fetches.join(','));
+    check('no ffmpeg.wasm -> badge says why', /not loaded/i.test(r.title), r.title);
+
+    // 2. Clip too large for the wasm heap -> skip before loading the core.
+    r = await runCase({ clip: HUGE_CLIP, behaviour: {} });
+    check('oversized clip -> compatibility mode', r.mode === 'compat', r.mode);
+    check('oversized clip -> never fetched raw bytes',
+          !r.fetches.some((u) => u.startsWith('api/stream-raw')), r.fetches.join(','));
+    check('oversized clip -> badge cites the limit', /limit/i.test(r.title), r.title);
+
+    // 3. Happy path.
+    r = await runCase({ clip: SMALL_CLIP, behaviour: {} });
+    check('working wasm -> fast mode', r.mode === 'fast', r.mode);
+    check('working wasm -> plays a blob, not the server path',
+          r.src.startsWith('blob:'), r.src);
+    check('working wasm -> fetched raw bytes at sd by default',
+          r.fetches.some((u) => u === 'api/stream-raw/abc123?quality=sd'), r.fetches.join(','));
+    check('fast badge is legible in a screenshot', /fast/i.test(r.label), r.label);
+
+    // 4. Core fails to load -> clean fallback.
+    r = await runCase({ clip: SMALL_CLIP, behaviour: { loadThrows: true } });
+    check('core load throws -> compatibility mode', r.mode === 'compat', r.mode);
+    check('core load throws -> plays via api/stream', r.src.startsWith('api/stream/'), r.src);
+
+    // 5. ffmpeg exits non-zero -> clean fallback.
+    r = await runCase({ clip: SMALL_CLIP, behaviour: { exitCode: 1 } });
+    check('non-zero exit -> compatibility mode', r.mode === 'compat', r.mode);
+    check('non-zero exit -> plays via api/stream', r.src.startsWith('api/stream/'), r.src);
+
+    // 6. Remux produces nothing -> must not hand the player an empty blob.
+    r = await runCase({ clip: SMALL_CLIP, behaviour: { output: new Uint8Array([]) } });
+    check('empty output -> compatibility mode', r.mode === 'compat', r.mode);
+    check('empty output -> plays via api/stream', r.src.startsWith('api/stream/'), r.src);
+
+    // 7. Raw endpoint errors (e.g. 503 busy) -> clean fallback carrying the reason.
+    r = await runCase({
+      clip: SMALL_CLIP,
+      behaviour: {},
+      raw: () => ({ ok: false, status: 503, json: async () => ({ detail: 'DVR is busy.' }) }),
+    });
+    check('raw 503 -> compatibility mode', r.mode === 'compat', r.mode);
+    check('raw 503 -> badge carries the reason', /busy/i.test(r.title), r.title);
+
+    // 8. HD reaches the client path.
+    r = await runCase({ clip: SMALL_CLIP, behaviour: {}, quality: 'hd' });
+    check('hd -> fast mode', r.mode === 'fast', r.mode);
+    check('hd -> raw fetched at hd',
+          r.fetches.some((u) => u === 'api/stream-raw/abc123?quality=hd'), r.fetches.join(','));
+
+    // 9. HD reaches the FALLBACK path too — quality must not be lost on the way down.
+    r = await runCase({ clip: SMALL_CLIP, behaviour: { exitCode: 1 }, quality: 'hd' });
+    check('hd fallback -> compatibility mode', r.mode === 'compat', r.mode);
+    check('hd fallback -> server path keeps quality=hd',
+          r.src === 'api/stream/abc123?quality=hd', r.src);
+  } catch (err) {
+    check('harness ran without throwing', false, String(err && err.stack || err));
+  }
+
+  window.RESULT = {
+    done: true,
+    passed: checks.filter((c) => c.pass).length,
+    failed: checks.filter((c) => !c.pass).length,
+    failures: checks.filter((c) => !c.pass),
+  };
+})();
+</script>
+</body>
+</html>

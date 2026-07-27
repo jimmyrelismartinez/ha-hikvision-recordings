@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 tests/fixtures/*.ps
+
+# Vendored at build time by the Dockerfile (32 MB wasm) — see scripts/fetch-ffmpeg-wasm.sh
+hikvision_recordings/www/vendor/
