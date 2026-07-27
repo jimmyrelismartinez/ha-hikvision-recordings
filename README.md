@@ -90,6 +90,28 @@ frontend simply uses the compatibility path.
 > It resolves correctly, which is why `vendor/814.ffmpeg.js` must stay beside
 > `vendor/ffmpeg.js`.
 
+### If a new version's UI doesn't appear after updating
+
+The SD/HD toggle and the mode badge live **inside a clip's player panel** — tap a row
+in the results list to open it. They are not on the collapsed list rows.
+
+If you have tapped a clip and still see only the bare video controls, you are almost
+certainly running a **cached copy of an older frontend**. This bit us on v0.1.4:
+`api/health` correctly reported the new version (a fresh API call) while the iPhone
+kept executing the previous release's `app.js`, so the add-on looked broken when it
+had simply never loaded the new UI.
+
+Fixed in v0.1.6 and it should not recur: the HTML/JS/CSS are now served with
+`Cache-Control: no-cache` (always revalidate — a cheap 304 when unchanged) and asset
+URLs carry the add-on version, so `app.js?v=0.1.6` cannot be answered from a cached
+`app.js?v=0.1.4`. The ~32 MB `vendor/` wasm core is still cached hard, since its
+content is pinned by version in the `Dockerfile`.
+
+**Escaping a cache from before v0.1.6 may still need one manual nudge**, because the
+old response never told the browser to revalidate: in the HA Companion app, Settings →
+Companion App → Debugging → **Reset frontend cache**, or open the panel once in a
+regular browser.
+
 ### SD / HD
 
 Each clip has an **SD / HD** toggle next to the player, defaulting to SD:

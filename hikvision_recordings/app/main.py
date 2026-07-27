@@ -34,7 +34,7 @@ from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -86,6 +86,42 @@ def _check_quality(quality: str) -> None:
         raise HTTPException(
             status_code=400, detail="quality must be 'sd' or 'hd'."
         )
+
+
+# ── STATIC ASSET CACHING — THIS IS A BUG FIX, NOT A TUNING KNOB ──────────────
+# Starlette's StaticFiles sends ETag + Last-Modified but NO Cache-Control. With no
+# explicit freshness, browsers fall back to HEURISTIC caching (RFC 9111 §4.2.2):
+# they invent a lifetime from Last-Modified and reuse the asset WITHOUT
+# revalidating. iOS WKWebView — the HA Companion app — is especially eager here.
+#
+# Verified failure, 2026-07-27: after updating v0.1.3 -> v0.1.4, Ramon's iPhone
+# kept executing the CACHED v0.1.3 app.js. api/health correctly reported 0.1.4 (a
+# fresh API call), while the UI was the old renderer, which appended only
+# <video>/hint/download and had no SD/HD picker and no mode badge — exactly the
+# "nothing but native video controls" symptom he reported. The add-on looked
+# broken when it was simply never running the shipped frontend.
+#
+# So: the app's own HTML/JS/CSS must ALWAYS revalidate. `no-cache` does not mean
+# "don't store" — it means "revalidate before reuse", so the usual outcome is a
+# cheap 304 on an unchanged file, not a re-download.
+NO_CACHE = "no-cache"
+# The vendored ffmpeg.wasm core is ~32 MB and its content is pinned by version in
+# the Dockerfile, so it is safe (and important) to cache hard. A new add-on
+# version rebuilds the image and would ship a different file.
+VENDOR_CACHE = "public, max-age=31536000, immutable"
+VENDOR_PREFIX = "vendor/"
+
+
+class _CachePolicyStatic(StaticFiles):
+    """StaticFiles that states its freshness instead of leaving it to guesswork."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        normalised = path.lstrip("/")
+        response.headers["Cache-Control"] = (
+            VENDOR_CACHE if normalised.startswith(VENDOR_PREFIX) else NO_CACHE
+        )
+        return response
 
 
 ERROR_STATUS = {
@@ -515,10 +551,26 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
 
     @app.get("/")
     async def index():
-        return FileResponse(WWW_DIR / "index.html")
+        """Serve the shell with version-stamped asset URLs.
+
+        Belt and braces with the no-cache header above. If a browser is still
+        holding a previous version's app.js and considers it fresh, it will not
+        even ask the server — so it never learns about the new policy. Stamping the
+        version into the URL sidesteps that entirely: `app.js?v=0.1.6` is a
+        different resource from `app.js?v=0.1.4`, so there is nothing to reuse.
+        This is what stops a frontend upgrade from silently not taking effect.
+        """
+        html = (WWW_DIR / "index.html").read_text(encoding="utf-8")
+        for asset in ("app.js", "style.css", "vendor/ffmpeg.js"):
+            html = html.replace(f'"{asset}"', f'"{asset}?v={VERSION}"')
+        return Response(
+            content=html,
+            media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": NO_CACHE},
+        )
 
     # Mounted last so it can never shadow the /api routes above.
-    app.mount("/", StaticFiles(directory=str(WWW_DIR)), name="static")
+    app.mount("/", _CachePolicyStatic(directory=str(WWW_DIR)), name="static")
     return app
 
 

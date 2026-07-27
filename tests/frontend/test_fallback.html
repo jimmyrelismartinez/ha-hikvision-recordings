@@ -172,6 +172,50 @@ async function runCase({ clip, behaviour, raw, quality }) {
     check('hd fallback -> compatibility mode', r.mode === 'compat', r.mode);
     check('hd fallback -> server path keeps quality=hd',
           r.src === 'api/stream/abc123?quality=hd', r.src);
+    // 10. THE PATH A USER ACTUALLY TAKES: renderClip() -> tap the row -> player.
+    //
+    // Everything above calls buildPlayer() directly, which is why this suite went
+    // green while Ramon's phone showed no picker and no badge at all. The real
+    // entry point is the click handler renderClip() attaches, and nothing was
+    // pinning it. (That specific incident was a stale cached app.js rather than a
+    // code fault, but the gap was real: this suite could not have told the
+    // difference.)
+    window.__fetches = [];
+    ffmpegPromise = null;
+    installFFmpeg({});
+    const row = renderClip({
+      id: 'row777', channel: 101, channel_name: 'DriveWay1',
+      start: new Date().toISOString(), end: new Date().toISOString(),
+      duration_s: 36, size_bytes: 4 * 1024 * 1024,
+    });
+    document.getElementById('cases').appendChild(row);
+
+    const bodyBefore = row.querySelector('.clip-body');
+    check('before the tap: player body is hidden', bodyBefore && bodyBefore.hidden === true,
+          String(bodyBefore && bodyBefore.hidden));
+    check('before the tap: no picker or badge exists yet',
+          !row.querySelector('.quality') && !row.querySelector('.mode-badge'));
+
+    row.querySelector('.clip-header').click();
+    const badgeAfter = () => row.querySelector('.mode-badge');
+    for (let i = 0; i < 200 && !(badgeAfter() && badgeAfter().dataset.mode
+                                 && badgeAfter().dataset.mode !== 'working'); i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const bodyAfter = row.querySelector('.clip-body');
+    check('tapping the row reveals the player body', bodyAfter && bodyAfter.hidden === false,
+          String(bodyAfter && bodyAfter.hidden));
+    check('tapping the row renders the SD/HD picker', !!row.querySelector('.quality'));
+    check('picker offers exactly SD and HD',
+          [...row.querySelectorAll('.quality button')].map((b) => b.textContent).join(',') === 'SD,HD',
+          [...row.querySelectorAll('.quality button')].map((b) => b.textContent).join(','));
+    check('tapping the row renders the mode badge', !!badgeAfter());
+    check('badge reports a real path after the tap',
+          badgeAfter() && ['fast', 'compat'].includes(badgeAfter().dataset.mode),
+          badgeAfter() ? badgeAfter().dataset.mode : 'none');
+    check('picker and badge sit inside the clip body, not the list row',
+          bodyAfter && bodyAfter.contains(row.querySelector('.quality'))
+                    && bodyAfter.contains(badgeAfter()));
   } catch (err) {
     check('harness ran without throwing', false, String(err && err.stack || err));
   }
