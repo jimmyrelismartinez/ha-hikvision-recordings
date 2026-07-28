@@ -19,6 +19,14 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Notes
 
+### Search defaults and result order (v0.1.7)
+
+The search page opens with **Last hour** pre-selected instead of Today — the common
+case (checking who just showed up) needs zero taps now. Results also come back
+**newest first**. Note this only reorders what the DVR already returned in one page —
+it does not change which clips were selected before the `max_results` cutoff
+(`truncated: true`); a full fix for that would need DVR-side paging.
+
 ### Two playback paths: browser remux first, server remux as the fallback
 
 Playing a clip tries the **fast path** first and silently drops to the **compatibility
@@ -31,9 +39,13 @@ which one actually ran, so you can tell them apart at a glance (or in a screensh
 | **Compatibility · server remux** | `/api/stream` | The original path: fetch, remux with ffmpeg on the host, stage to RAM, serve with `Content-Length` + Range. Unchanged from v0.1.1/v0.1.3. |
 
 The fast path is skipped **before** anything is downloaded when it could not work:
-ffmpeg.wasm missing, or a clip larger than 64 MB (the raw clip and its remuxed copy
-both sit in the wasm heap, and a phone will run out of memory rather than raise a
-catchable error). Any failure at all — core won't load, DVR returns 503, ffmpeg exits
+ffmpeg.wasm missing, or a clip larger than the in-browser cap — **128 MB by default as
+of v0.1.7** (doubled from 64 MB; the raw clip and its remuxed copy both sit in the wasm
+heap, and a phone will run out of memory rather than raise a catchable error). The cap
+is configurable via the `client_remux_max_mb` add-on option (16–512, default 128) — the
+server exposes it on `/api/health` and the frontend picks it up automatically on load, so
+lowering it on a memory-constrained device (or raising it if your phones can take it)
+needs no code change. Any failure at all — core won't load, DVR returns 503, ffmpeg exits
 non-zero, output is empty — falls through to the compatibility path. There is no dead
 end; the worst case is the behaviour you already had.
 

@@ -20,6 +20,7 @@ VALID = {
     "channels": [{"id": 101, "name": "DriveWay1"}, {"id": 401, "name": "ENTRYWAY"}],
     "max_results": 40,
     "max_concurrent_downloads": 2,
+    "client_remux_max_mb": 128,
     "log_level": "info",
 }
 
@@ -48,6 +49,18 @@ def test_defaults_are_applied():
     assert cfg.max_results == 40
     assert cfg.max_concurrent_downloads == 2
     assert cfg.dvr_time_mode == "auto"
+    assert cfg.client_remux_max_mb == 128
+
+
+def test_client_remux_max_mb_defaults_to_128_when_omitted():
+    without_key = {k: v for k, v in VALID.items() if k != "client_remux_max_mb"}
+    cfg = load_config(without_key)
+    assert cfg.client_remux_max_mb == 128
+
+
+def test_client_remux_max_mb_round_trips():
+    cfg = load_config({**VALID, "client_remux_max_mb": 256})
+    assert cfg.client_remux_max_mb == 256
 
 
 @pytest.mark.parametrize("field", ["dvr_host", "dvr_username", "dvr_password"])

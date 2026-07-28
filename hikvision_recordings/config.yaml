@@ -1,5 +1,5 @@
 name: DVR Recordings
-version: "0.1.6"
+version: "0.1.7"
 slug: hikvision_recordings
 description: Browse, play and download existing recordings from a Hikvision DVR/NVR
 url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings
@@ -32,6 +32,7 @@ options:
   max_results: 40
   max_concurrent_downloads: 2
   max_stage_mb: 256
+  client_remux_max_mb: 128
   log_level: info
 schema:
   dvr_host: str
@@ -46,4 +47,5 @@ schema:
   max_results: int(1,200)
   max_concurrent_downloads: int(1,4)
   max_stage_mb: int(16,1024)
+  client_remux_max_mb: int(16,512)
   log_level: list(trace|debug|info|warning|error|critical)

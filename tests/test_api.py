@@ -175,6 +175,32 @@ def test_health_reports_dvr_state():
     assert body["clock_source"] == "configured"
 
 
+def test_health_reports_client_remux_max_mb():
+    with client_for(FakeClient(), client_remux_max_mb=200) as client:
+        body = client.get("/api/health").json()
+    assert body["client_remux_max_mb"] == 200
+
+
+def test_recordings_are_ordered_newest_first():
+    older = RECORDING
+    newer = Recording(
+        channel=101,
+        start=datetime(2026, 7, 25, 9, 0, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 7, 25, 9, 1, 0, tzinfo=timezone.utc),
+        size_bytes=1000,
+        playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260725T090000Z&size=1000",
+    )
+    fake = FakeClient(recordings=[older, newer])
+    with client_for(fake, max_results=40) as client:
+        body = client.get(
+            "/api/recordings",
+            params={"channel": 101, "start": "2026-07-24T00:00:00Z", "end": "2026-07-26T00:00:00Z"},
+        ).json()
+    starts = [clip["start"] for clip in body["clips"]]
+    assert starts == sorted(starts, reverse=True)
+    assert starts[0].startswith("2026-07-25")
+
+
 def test_index_is_served_at_root():
     with client_for(FakeClient()) as client:
         response = client.get("/")

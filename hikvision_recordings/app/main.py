@@ -34,7 +34,7 @@ from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -197,6 +197,7 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             "clock_source": dvr.clock.source,
             "clock_drift_s": int(getattr(dvr.clock, "drift", timedelta(0)).total_seconds()),
             "version": VERSION,
+            "client_remux_max_mb": config.client_remux_max_mb,
         }
 
     @app.get("/api/recordings")
@@ -215,6 +216,11 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             found = await dvr.search(channel, start_utc, end_utc)
         except DvrError as exc:
             raise _http_error(exc) from exc
+
+        # Newest first. Note: this only reorders what the DVR already returned —
+        # it does not change which clips were selected before truncation (see
+        # `truncated` below); a full fix would need DVR-side paging.
+        found = sorted(found, key=lambda r: r.start, reverse=True)
 
         clips = []
         for recording in found:

@@ -77,6 +77,9 @@ function check(name, cond, detail) {
 
 const SMALL_CLIP = { id: 'abc123', size_bytes: 4 * 1024 * 1024, duration_s: 35 };
 const HUGE_CLIP = { id: 'big999', size_bytes: 512 * 1024 * 1024, duration_s: 900 };
+// Boundary clips for the doubled cap (64MB -> 128MB, v0.1.7).
+const JUST_UNDER_NEW_CAP_CLIP = { id: 'cap065', size_bytes: 65 * 1024 * 1024, duration_s: 400 };
+const JUST_OVER_NEW_CAP_CLIP = { id: 'cap129', size_bytes: 129 * 1024 * 1024, duration_s: 800 };
 
 async function runCase({ clip, behaviour, raw, quality }) {
   window.__fetches = [];
@@ -160,6 +163,16 @@ async function runCase({ clip, behaviour, raw, quality }) {
     });
     check('raw 503 -> compatibility mode', r.mode === 'compat', r.mode);
     check('raw 503 -> badge carries the reason', /busy/i.test(r.title), r.title);
+
+    // 7b. Doubled cap (v0.1.7): a 65MB clip is now under the 128MB cap -> fast mode.
+    r = await runCase({ clip: JUST_UNDER_NEW_CAP_CLIP, behaviour: {} });
+    check('65MB clip is under the doubled cap -> fast mode', r.mode === 'fast', r.mode);
+
+    // 7c. A 129MB clip is still over the doubled cap -> compat, never fetched raw.
+    r = await runCase({ clip: JUST_OVER_NEW_CAP_CLIP, behaviour: {} });
+    check('129MB clip is over the doubled cap -> compatibility mode', r.mode === 'compat', r.mode);
+    check('129MB clip -> never fetched raw bytes',
+          !r.fetches.some((u) => u.startsWith('api/stream-raw')), r.fetches.join(','));
 
     // 8. HD reaches the client path.
     r = await runCase({ clip: SMALL_CLIP, behaviour: {}, quality: 'hd' });

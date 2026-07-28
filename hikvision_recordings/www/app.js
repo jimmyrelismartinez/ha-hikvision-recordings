@@ -64,6 +64,9 @@ async function loadHealth() {
       statusEl.textContent = 'DVR unreachable';
       statusEl.className = 'status bad';
     }
+    if (typeof health.client_remux_max_mb === 'number' && health.client_remux_max_mb > 0) {
+      CLIENT_REMUX_MAX_BYTES = health.client_remux_max_mb * 1024 * 1024;
+    }
   } catch (err) {
     statusEl.textContent = '';
   }
@@ -148,7 +151,7 @@ function attachThumb(item, clip) {
 // target) a large clip will exhaust memory rather than throw something catchable.
 // Compared against the MAINSTREAM size from the search result, which is the
 // conservative direction — an SD fetch is roughly half of it.
-const CLIENT_REMUX_MAX_BYTES = 64 * 1024 * 1024;
+let CLIENT_REMUX_MAX_BYTES = 128 * 1024 * 1024;
 
 const QUALITIES = ['sd', 'hd'];
 const DEFAULT_QUALITY = 'sd';
@@ -423,7 +426,7 @@ for (const button of document.querySelectorAll('[data-preset]')) {
 }
 
 (async function init() {
-  applyPreset('today');
+  applyPreset('1h');
   try {
     await loadChannels();
   } catch (err) {
