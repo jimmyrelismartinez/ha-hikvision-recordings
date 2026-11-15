@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import AsyncIterator
 
 LOG = logging.getLogger(__name__)
 
 READ_CHUNK = 65536
+
+# ffmpeg must not inherit SUPERVISOR_TOKEN (it parses untrusted device bytes).
+_FFMPEG_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
 
 # ── VERIFIED FLAGS — DO NOT EDIT WITHOUT RE-TESTING AGAINST A REAL DVR CLIP ──
 # `frag_keyframe+empty_moov` puts a valid ftyp+moov at byte 0, so the browser can
@@ -47,6 +51,7 @@ async def remux_to_fmp4(source: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_FFMPEG_ENV,
     )
 
     async def feed() -> None:
