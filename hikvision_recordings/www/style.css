@@ -55,9 +55,179 @@ button:disabled { cursor: default; }
 
 header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1rem; }
 h1 { font-size: 1.35rem; margin: 0; }
-.status { font-size: 0.8rem; color: var(--muted); }
+.tabs { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+.tab {
+  min-height: var(--tap); padding: 0 0.9rem; display: inline-flex; align-items: center;
+  text-decoration: none; color: var(--muted); border: 1px solid transparent; border-radius: 8px;
+  font-size: 0.9rem; font-weight: 600;
+}
+.tab[aria-current="page"] { color: var(--text); background: var(--panel); border-color: var(--border); }
+.status { font-size: 0.8rem; color: var(--muted); margin-left: auto; }
 .status.ok { color: var(--ok); }
 .status.bad { color: var(--bad); }
+
+/* ── Views: #player-panel is never re-parented; body.view-* switches layout ─ */
+.view { margin-top: 0.25rem; }
+.section-title { font-size: 1.05rem; margin: 1.25rem 0 0.6rem; }
+body.view-home #player-panel { display: none !important; }
+body.view-home #view-camera,
+body.view-home #view-all { display: none !important; }
+body.view-all #view-home,
+body.view-all #view-camera { display: none !important; }
+body.view-camera #view-home,
+body.view-camera #view-all { display: none !important; }
+
+/* Camera page: toolbar → stage (player-panel) → timeline, without moving the panel. */
+body.view-camera {
+  display: flex; flex-direction: column;
+}
+body.view-camera header { order: 0; }
+body.view-camera #view-camera { display: contents; }
+body.view-camera .camera-toolbar { order: 1; }
+body.view-camera #player-panel { order: 2; }
+body.view-camera .camera-chrome { order: 3; }
+body.view-camera #stage-slot { display: none; }
+
+.camera-toolbar {
+  display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 0.5rem;
+}
+.back-link {
+  min-height: var(--tap); display: inline-flex; align-items: center;
+  color: var(--accent); text-decoration: none; font-weight: 600; padding: 0 0.25rem;
+}
+.camera-title { font-size: 1.1rem; margin: 0; flex: 1; min-width: 0; }
+.live-button {
+  min-height: var(--tap); padding: 0 1rem;
+  background: var(--field); color: var(--ok); border: 1px solid var(--border);
+  border-radius: 8px; font-weight: 700;
+}
+
+.timeline-sticky {
+  position: sticky; top: 0; z-index: 4;
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  padding: 0.4rem 0; background: var(--bg);
+}
+.date-chip {
+  min-height: var(--tap); padding: 0 1rem;
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; font-weight: 600;
+}
+.date-jump {
+  position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0;
+}
+.event-filters { display: flex; flex-wrap: wrap; gap: 0.4rem; flex: 1; }
+
+/* Stage (snapshot / latest) lives inside the shared player panel. */
+.stage-live { position: relative; }
+.stage-image {
+  display: block; width: 100%; max-height: 42vh; object-fit: contain;
+  border-radius: 8px; background: #000; min-height: 120px;
+}
+.stage-label {
+  position: absolute; left: 0.6rem; bottom: 0.6rem; margin: 0;
+  background: rgba(0,0,0,0.55); color: #fff; font-size: 0.8rem; font-weight: 600;
+  padding: 0.25rem 0.55rem; border-radius: 6px;
+}
+.stage-paused {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  margin: 0; background: rgba(0,0,0,0.45); color: #fff; font-weight: 600; border-radius: 8px;
+  cursor: pointer;
+}
+
+/* Vertical timeline (simplified: fixed row height, gap bands, no hour ticks). */
+.vtimeline { margin-top: 0.25rem; }
+.vday { margin-bottom: 1rem; }
+.vday-head { font-size: 0.95rem; margin: 0 0 0.4rem; color: var(--muted); }
+.vnow {
+  font-size: 0.75rem; font-weight: 700; color: var(--now);
+  border-top: 2px solid var(--now); padding-top: 0.2rem; margin-bottom: 0.4rem;
+}
+.vday-error {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+  padding: 0.6rem 0.8rem; background: var(--bad-bg); color: var(--bad); border-radius: 8px;
+}
+.vrow {
+  display: grid; grid-template-columns: 4.5rem 14px minmax(0, 1fr);
+  gap: 0.5rem; align-items: stretch; min-height: 72px;
+}
+.vrow.dimmed .vrow-seg { opacity: 0.25; }
+.vrow-time {
+  font-size: 0.8rem; color: var(--muted); font-variant-numeric: tabular-nums;
+  padding-top: 0.5rem; text-align: right;
+}
+.vrow-bar { position: relative; background: var(--border); border-radius: 2px; }
+.vrow-seg {
+  position: absolute; left: 0; right: 0; top: 4px; bottom: 4px;
+  background: var(--seg); border-radius: 2px;
+}
+.vrow.active .vrow-seg { background: var(--seg-active); }
+.vrow-card {
+  display: flex; gap: 0.5rem; align-items: stretch; text-align: left;
+  background: var(--panel); border: 2px solid transparent; border-radius: 10px;
+  box-shadow: var(--shadow); padding: 0; color: var(--text); overflow: hidden;
+  min-height: var(--tap);
+}
+.vrow-card .clip-thumb {
+  flex: none; width: 112px; aspect-ratio: auto; height: 100%; min-height: 72px;
+  border-bottom: 0; border-right: 1px solid var(--border);
+}
+.vrow-card-body { flex: 1; min-width: 0; padding: 0.5rem 0.65rem; }
+.vrow-card-time { font-weight: 600; font-size: 0.9rem; }
+.vrow.active .vrow-card { border-color: var(--seg-active); }
+.vgap {
+  height: 28px; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 0.75rem; margin: 0.15rem 0 0.15rem 5.2rem;
+}
+.day-sentinel { height: 1px; }
+
+/* Home: recent strip + camera tiles */
+.recent-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+.recent-head h2 { font-size: 1.05rem; margin: 0; }
+.see-all { color: var(--accent); text-decoration: none; font-weight: 600; min-height: var(--tap); display: inline-flex; align-items: center; }
+.recent-strip {
+  display: flex; gap: 0.65rem; overflow-x: auto; padding: 0.5rem 0 0.75rem;
+  -webkit-overflow-scrolling: touch; scroll-snap-type: x mandatory;
+}
+.recent-card {
+  flex: none; width: 168px; scroll-snap-align: start;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 0; overflow: hidden; color: var(--text); text-align: left;
+}
+.recent-card .clip-thumb { border-bottom: 1px solid var(--border); }
+.recent-meta { padding: 0.45rem 0.55rem 0.6rem; }
+.recent-name { font-weight: 700; font-size: 0.85rem; }
+.recent-when { color: var(--muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+
+.camera-tiles {
+  display: grid; grid-template-columns: 1fr; gap: 0.75rem;
+}
+@media (min-width: 600px) { .camera-tiles { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 1000px) { .camera-tiles { grid-template-columns: 1fr 1fr 1fr; } }
+.camera-tile {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 0; overflow: hidden; color: var(--text); text-align: left;
+}
+.tile-media { position: relative; border-bottom: 1px solid var(--border); }
+.tile-paused {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.45); color: #fff; font-weight: 600; font-size: 0.85rem;
+}
+.tile-foot {
+  display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+  padding: 0.55rem 0.7rem; min-height: var(--tap);
+}
+.tile-name { font-weight: 700; }
+.tile-ago { color: var(--muted); font-size: 0.8rem; }
+.tile-error {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--bad); margin-left: auto;
+}
+
+.event-badges { display: inline-flex; flex-wrap: wrap; gap: 0.25rem; }
+.event-badge {
+  font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em;
+  padding: 0.1rem 0.35rem; border-radius: 4px; background: var(--field); color: var(--muted);
+  border: 1px solid var(--border);
+}
 
 /* ── Search form ─────────────────────────────────────────────────────────── */
 .controls {
@@ -99,7 +269,10 @@ button.primary:disabled { opacity: 0.6; }
   position: sticky; top: 0; z-index: 5;
   background: var(--panel); box-shadow: var(--shadow);
   border-radius: 12px; padding: 0.75rem;
+  margin-top: 1rem;
 }
+body.view-camera .player-panel { margin-top: 0; }
+body.view-all .player-panel { margin-top: 1rem; }
 .player-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
 .player-title { display: flex; flex-wrap: wrap; gap: 0 0.6rem; align-items: baseline; min-width: 0; flex: 1; }
 .player-camera { font-weight: 700; }
@@ -129,10 +302,16 @@ button.primary:disabled { opacity: 0.6; }
 .browse { min-width: 0; }
 
 @media (min-width: 1000px) {
-  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 42%); align-items: start; }
-  .browse { grid-column: 1; grid-row: 1; }
-  .player-panel { grid-column: 2; grid-row: 1; top: 1rem; }
-  .player-body video { max-height: 60vh; }
+  body.view-all {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(360px, 42%);
+    align-items: start;
+    column-gap: 1rem;
+  }
+  body.view-all header { grid-column: 1 / -1; }
+  body.view-all #view-all { grid-column: 1; grid-row: 2; }
+  body.view-all #player-panel { grid-column: 2; grid-row: 2; top: 1rem; margin-top: 1rem; }
+  .player-body video, .stage-image { max-height: 60vh; }
 }
 
 /* ── Messages and banners ────────────────────────────────────────────────── */
