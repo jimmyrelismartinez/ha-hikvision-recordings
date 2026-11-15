@@ -274,9 +274,11 @@ function serialise(task) {
   return run;
 }
 
-async function remuxInBrowser(clip, quality) {
+async function remuxInBrowser(clip, quality, signal) {
   const ff = await getFFmpeg();
-  const response = await fetch(`api/stream-raw/${clip.id}?quality=${quality}`);
+  // `signal` aborts the raw download when the player moves on: a stale fetch
+  // would otherwise hold one of the DVR's download slots for the whole clip.
+  const response = await fetch(`api/stream-raw/${clip.id}?quality=${quality}`, { signal });
   if (!response.ok) {
     let detail = `the add-on returned HTTP ${response.status}`;
     try { detail = (await response.json()).detail || detail; } catch (err) { /* not JSON */ }
@@ -349,6 +351,7 @@ function buildPlayer(clip, body, opts = {}) {
   let quality = QUALITIES.includes(opts.quality) ? opts.quality : DEFAULT_QUALITY;
   let blobUrl = null;
   let generation = 0;     // bumps on every play() and on dispose()
+  let inflight = null;    // AbortController of the remux this player is waiting on
 
   const video = opts.video || document.createElement('video');
   video.controls = true;
@@ -409,7 +412,15 @@ function buildPlayer(clip, body, opts = {}) {
   }
   updateDownload();
 
-  body.append(bar, video, hint, download);
+  bar.append(download);
+  if (video.parentNode === body) {
+    // A reused element stays where it is: detaching it would drop fullscreen
+    // (and, on iOS, risks the autoplay grant) between clips.
+    body.insertBefore(bar, video);
+    video.after(hint);
+  } else {
+    body.append(bar, video, hint);
+  }
 
   function freeBlob() {
     if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
@@ -422,8 +433,14 @@ function buildPlayer(clip, body, opts = {}) {
     video.play().catch(() => { /* iOS wants a second tap; the controls handle it */ });
   }
 
+  function cancelInflight() {
+    if (inflight) { inflight.abort(); inflight = null; }
+  }
+
   async function play() {
     const mine = ++generation;
+    const q = quality;            // the queue may run this later — pin it now
+    cancelInflight();
     freeBlob();
 
     if (clip.playback === 'direct') {
@@ -431,7 +448,7 @@ function buildPlayer(clip, body, opts = {}) {
       // proxies it with Range — no ffmpeg anywhere, and seeking works.
       setMode(badge, 'direct', 'camera MP4 proxied as-is — seeking works');
       hint.textContent = '';
-      video.src = `api/stream/${clip.id}?quality=${quality}`;   // relative — see rule at top
+      video.src = `api/stream/${clip.id}?quality=${q}`;   // relative — see rule at top
       video.play().catch(() => { /* iOS wants a second tap */ });
       return;
     }
@@ -445,9 +462,16 @@ function buildPlayer(clip, body, opts = {}) {
     }
 
     setMode(badge, 'working', 'fetching raw clip and remuxing with ffmpeg.wasm');
+    const controller = new AbortController();
+    inflight = controller;
     try {
-      const blob = await serialise(() => remuxInBrowser(clip, quality));
+      // Remuxes are serialised (one wasm instance). A task that became stale while
+      // it waited in the queue must not start its download at all.
+      const blob = await serialise(() => (mine !== generation
+        ? Promise.reject(new Error('stale'))
+        : remuxInBrowser(clip, q, controller.signal)));
       if (mine !== generation) return;    // switched quality, or the player closed
+      inflight = null;
       blobUrl = URL.createObjectURL(blob);
       video.src = blobUrl;
       setMode(badge, 'fast', 'remuxed in-browser by ffmpeg.wasm — seeking works');
@@ -463,6 +487,7 @@ function buildPlayer(clip, body, opts = {}) {
 
   function dispose() {
     generation++;
+    cancelInflight();
     video.onended = null;
     try { video.pause(); } catch (err) { /* not started */ }
     video.removeAttribute('src');
@@ -481,32 +506,36 @@ function buildPlayer(clip, body, opts = {}) {
  * ─────────────────────────────────────────────────────────────────────────── */
 let clipsNewest = [];
 let clipsAsc = [];
-let ascIndexById = new Map();
+let ascIndexByKey = new Map();
 let rowsShown = 0;
 let current = null;               // { clip, player }
 const savedQuality = loadPref(STORE.quality, DEFAULT_QUALITY);
 let preferredQuality = QUALITIES.includes(savedQuality) ? savedQuality : DEFAULT_QUALITY;
 const panelVideo = document.createElement('video');
 
+// Clip ids are minted fresh by every search (even an identical one), so "the
+// same clip" across searches is camera + start time, never the id.
+const clipKey = (c) => `${c.camera_key}|${Date.parse(c.start)}`;
+const byTime = (a, b) => (Date.parse(a.start) - Date.parse(b.start))
+  || String(a.camera_key).localeCompare(String(b.camera_key));
+
 function setClips(clips) {
   clipsNewest = clips.slice();
-  clipsAsc = clips.slice().sort((a, b) => (Date.parse(a.start) - Date.parse(b.start))
-    || String(a.camera_key).localeCompare(String(b.camera_key))
-    || String(a.id).localeCompare(String(b.id)));
-  ascIndexById = new Map(clipsAsc.map((c, i) => [c.id, i]));
+  clipsAsc = clips.slice().sort((a, b) => byTime(a, b) || String(a.id).localeCompare(String(b.id)));
+  ascIndexByKey = new Map(clipsAsc.map((c, i) => [clipKey(c), i]));
 }
 
 function neighbourIndex(direction) {
   if (!current) return -1;
-  const i = ascIndexById.get(current.clip.id);
+  const i = ascIndexByKey.get(clipKey(current.clip));
   if (i !== undefined) {
     const j = i + direction;
     return j >= 0 && j < clipsAsc.length ? j : -1;
   }
-  // The playing clip is not in the latest search: step by time instead.
-  const t = Date.parse(current.clip.start);
-  if (direction > 0) return clipsAsc.findIndex((c) => Date.parse(c.start) > t);
-  for (let j = clipsAsc.length - 1; j >= 0; j--) if (Date.parse(clipsAsc[j].start) < t) return j;
+  // The playing clip is not in the latest search: step by (time, camera) — the
+  // same order as the list sort, so a clip starting the same second isn't skipped.
+  if (direction > 0) return clipsAsc.findIndex((c) => byTime(c, current.clip) > 0);
+  for (let j = clipsAsc.length - 1; j >= 0; j--) if (byTime(clipsAsc[j], current.clip) < 0) return j;
   return -1;
 }
 
@@ -515,9 +544,11 @@ function updateNav() {
   nextButton.disabled = neighbourIndex(1) < 0;
 }
 
-function markActive(id) {
-  for (const el of document.querySelectorAll('[data-clip-id]')) {
-    el.classList.toggle('active', el.dataset.clipId === String(id));
+function markActive(key) {
+  for (const el of document.querySelectorAll('[data-clip-key]')) {
+    const on = el.dataset.clipKey === key;
+    el.classList.toggle('active', on);
+    if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
   }
 }
 
@@ -525,7 +556,7 @@ function openClip(index) {
   const clip = clipsAsc[index];
   if (!clip) return;
   if (current) current.player.dispose();
-  playerBody.innerHTML = '';
+  for (const child of [...playerBody.childNodes]) if (child !== panelVideo) child.remove();
   playerPanel.hidden = false;
   const start = new Date(clip.start);
   playerCamera.textContent = clip.camera_name || clip.channel_name || cameraName(clip.camera_key);
@@ -542,7 +573,7 @@ function openClip(index) {
   });
   current = { clip, player };
   updateNav();
-  markActive(clip.id);
+  markActive(clipKey(clip));
 }
 
 function step(direction) {
@@ -563,6 +594,7 @@ function renderClip(clip) {
   const item = document.createElement('li');
   item.className = 'clip';
   item.dataset.clipId = clip.id;
+  item.dataset.clipKey = clipKey(clip);
 
   const start = new Date(clip.start);
   const header = document.createElement('button');
@@ -583,7 +615,7 @@ function renderClip(clip) {
 
   header.append(timeSpan, metaSpan, chipSpan);
   header.addEventListener('click', () => {
-    const index = ascIndexById.get(clip.id);
+    const index = ascIndexByKey.get(clipKey(clip));
     if (index !== undefined) openClip(index);
   });
 
@@ -601,7 +633,7 @@ function renderMoreRows() {
   const left = clipsNewest.length - rowsShown;
   showMoreButton.hidden = left <= 0;
   showMoreButton.textContent = `Show more (${left} left)`;
-  if (current) markActive(current.clip.id);
+  if (current) markActive(clipKey(current.clip));
 }
 
 /* ── Timeline: one lane per camera over the searched window ─────────────────
@@ -628,7 +660,7 @@ function renderTimeline(windowStart, windowEnd, laneKeys) {
   tick.setSeconds(0, 0);
   const minutes = tick.getHours() * 60 + tick.getMinutes();
   tick.setHours(0, Math.ceil(minutes / stepMin) * stepMin);
-  for (; tick.getTime() <= t0 + span; tick.setTime(tick.getTime() + stepMin * 60000)) {
+  for (; tick.getTime() <= t0 + span; tick.setMinutes(tick.getMinutes() + stepMin)) {
     const mark = document.createElement('span');
     mark.className = 'tl-tick';
     const at = (tick.getTime() - t0) / span;
@@ -659,6 +691,8 @@ function renderTimeline(windowStart, windowEnd, laneKeys) {
       seg.type = 'button';
       seg.className = 'tl-seg';
       seg.dataset.clipId = clip.id;
+      seg.dataset.clipKey = clipKey(clip);
+      seg.tabIndex = -1;          // keyboard users have the list (and j/k); 250 tab stops is a trap
       seg.style.left = pct(s);
       seg.style.width = `${Math.max(0, ((e - s) / span) * 100)}%`;
       const when = clockTime(new Date(clip.start));
@@ -690,6 +724,17 @@ function showSkeletons() {
     li.innerHTML = '<div class="clip-thumb"></div><div class="clip-header"><span class="bar"></span></div>';
     results.appendChild(li);
   }
+}
+
+// A failed search must not leave j/k and Earlier/Later pointing at clips that
+// are no longer on screen.
+function clearResults() {
+  results.innerHTML = '';
+  setClips([]);
+  rowsShown = 0;
+  showMoreButton.hidden = true;
+  timelineEl.hidden = true;
+  if (current) updateNav();
 }
 
 function renderBanners(errors) {
@@ -735,6 +780,7 @@ form.addEventListener('submit', async (event) => {
     const body = await response.json();
     results.innerHTML = '';
     if (!response.ok) {
+      clearResults();
       showMessage(body.detail || 'Search failed.', 'bad');
       return;
     }
@@ -746,7 +792,7 @@ form.addEventListener('submit', async (event) => {
     for (const clip of clips) {
       if (!laneKeys.includes(String(clip.camera_key))) laneKeys.push(String(clip.camera_key));
     }
-    if (current) updateNav();
+    if (current) { updateNav(); markActive(clipKey(current.clip)); }
     if (!clips.length) {
       const names = laneKeys.map(cameraName).join(', ');
       showMessage(`No recordings for ${names} between ${fromInput.value} and ${toInput.value}. Try a wider range.`);
@@ -762,7 +808,7 @@ form.addEventListener('submit', async (event) => {
       showMessage(`${count}.`);
     }
   } catch (err) {
-    results.innerHTML = '';
+    clearResults();
     showMessage('Could not reach the add-on. Is it running?', 'bad');
   } finally {
     searchButton.disabled = false;

@@ -114,7 +114,7 @@ button.primary:disabled { opacity: 0.6; }
 }
 .player-nav {
   display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
-  margin-top: 0.6rem; flex-wrap: wrap;
+  margin-top: 0.6rem; flex-wrap: nowrap;
 }
 .nav-button {
   min-height: var(--tap); padding: 0 1rem;
@@ -215,7 +215,7 @@ button.primary:disabled { opacity: 0.6; }
 .hint { color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
 .hint:empty { display: none; }
 .download {
-  display: inline-flex; align-items: center; min-height: var(--tap); margin-top: 0.5rem;
+  display: inline-flex; align-items: center; min-height: var(--tap); margin-left: auto;
   background: var(--accent); color: var(--accent-text);
   text-decoration: none; border-radius: 8px; padding: 0 1.1rem; font-weight: 600;
 }
@@ -278,6 +278,17 @@ button.primary:disabled { opacity: 0.6; }
   .clip { display: flex; align-items: stretch; }
   .clip-thumb { flex: none; width: 120px; border-bottom: 0; border-right: 1px solid var(--border); }
   .clip-header { flex: 1; min-width: 0; }
-  .player-body video { max-height: 30vh; }
+  .player-body video { max-height: 28vh; }
+  .player-panel { padding: 0.5rem 0.6rem; }
+  .player-head { margin-bottom: 0.35rem; }
+  .player-nav { margin-top: 0.4rem; }
+  .nav-button { padding: 0 0.75rem; }
   .keys-hint { display: none !important; }
+}
+
+/* Pin the player only when there is room for it AND the list. On a short screen
+   (landscape phone, the Companion app's panel) it scrolls with the page instead,
+   so its own controls can never end up below the bottom edge. */
+@media (max-height: 699px) {
+  .player-panel { position: static; }
 }

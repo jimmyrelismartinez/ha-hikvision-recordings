@@ -48,7 +48,11 @@ try { localStorage.clear(); } catch (err) { /* ignore */ }
 // Placeholder cameras only (privacy rule): never real names or addresses.
 window.__recordings = { clips: [], truncated: false, truncated_cameras: [], errors: [] };
 
-window.fetch = async (url) => {
+window.__aborted = [];
+window.__rawDelay = 0;
+window.__recordingsStatus = 200;
+
+window.fetch = async (url, options) => {
   window.__fetches.push(String(url));
   if (String(url).startsWith('api/channels')) {
     return { ok: true, json: async () => [
@@ -60,9 +64,23 @@ window.fetch = async (url) => {
     return { ok: true, json: async () => ({ dvr: 'ok', devices: [] }) };
   }
   if (String(url).startsWith('api/recordings')) {
-    return { ok: true, json: async () => window.__recordings };
+    const status = window.__recordingsStatus;
+    return { ok: status < 400, status,
+             json: async () => (status < 400 ? window.__recordings : { detail: 'Search failed upstream.' }) };
   }
   if (String(url).startsWith('api/stream-raw')) {
+    // A slow, abortable download — like a real DVR clip of tens of MB.
+    const signal = options && options.signal;
+    if (window.__rawDelay) {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, window.__rawDelay);
+        if (signal) signal.addEventListener('abort', () => {
+          clearTimeout(t);
+          window.__aborted.push(String(url));
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    }
     if (window.__nextRawResponse) return window.__nextRawResponse();
     return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
   }
@@ -312,7 +330,7 @@ async function runCase({ clip, behaviour, raw, quality }) {
     nextBtn.click();
     await until(() => pbadge() && pbadge().dataset.mode && pbadge().dataset.mode !== 'working');
     check('Later goes to the next clip in time, on the other camera', playing() === 'd2', playing());
-    check('remux clip keeps the remux path', ['fast', 'compat'].includes(pbadge().dataset.mode),
+    check('remux clip keeps the remux path (browser remux)', pbadge().dataset.mode === 'fast',
           pbadge().dataset.mode);
     nextBtn.click();
     await until(() => playing() === 'p3');
@@ -389,6 +407,92 @@ async function runCase({ clip, behaviour, raw, quality }) {
     check('partial failure still lists the other camera',
           document.querySelectorAll('#results .clip').length === 2);
     check('truncation notice names the camera', /Porch.*limit/.test(message.textContent), message.textContent);
+
+
+    // ── Review fixes ───────────────────────────────────────────────────────────
+    // M3: the backend mints FRESH ids on every search. Re-running the search while
+    // a clip plays must keep its highlight and its place in time — including a
+    // clip on another camera that starts the same second.
+    window.__recordings = { clips: [P3, D2, P1], truncated: false, truncated_cameras: [], errors: [] };
+    await search();
+    document.querySelector('#timeline .tl-seg[data-clip-id="d2"]').click();
+    await until(() => pbadge() && pbadge().dataset.mode === 'fast');
+    const fresh = (c, id) => Object.assign({}, c, { id });
+    const Q2 = clipAt('q2', 'reolink-0', 'Porch', 'reolink', 10, 10);   // same second as D2
+    window.__recordings = {
+      clips: [fresh(P3, 'p3x'), Q2, fresh(D2, 'd2x'), fresh(P1, 'p1x')],
+      truncated: false, truncated_cameras: [], errors: [],
+    };
+    await search();
+    check('re-search with fresh ids keeps the playing clip highlighted',
+          document.querySelectorAll('#results .active, #timeline .active').length === 2,
+          String(document.querySelectorAll('#results .active, #timeline .active').length));
+    check('highlighted elements carry aria-current',
+          document.querySelectorAll('[aria-current="true"]').length === 2);
+    check('Earlier still enabled after re-search', !document.getElementById('prev-clip').disabled);
+    nextBtn.click();
+    await until(() => playing() === 'q2');
+    check('Later after re-search: the same-second clip on the other camera is not skipped',
+          playing() === 'q2', playing());
+
+    // M2: a remux the user has moved on from is cancelled, and a queued one never
+    // starts its download.
+    window.__recordings = { clips: [P3, D2, P1], truncated: false, truncated_cameras: [], errors: [] };
+    await search();
+    window.__rawDelay = 300;
+    window.__aborted = [];
+    const rawBefore = window.__fetches.filter((u) => u.startsWith('api/stream-raw')).length;
+    document.querySelector('#timeline .tl-seg[data-clip-id="d2"]').click();
+    await sleep(30);
+    [...document.querySelectorAll('#player-body .quality button')].find((b) => b.textContent === 'HD').click();
+    await until(() => pbadge() && pbadge().dataset.mode === 'fast');
+    const raws = window.__fetches.filter((u) => u.startsWith('api/stream-raw')).slice(rawBefore);
+    check('quality switch mid-remux aborts the SD download',
+          window.__aborted.includes('api/stream-raw/d2?quality=sd'), window.__aborted.join(','));
+    check('… and the HD remux is what plays',
+          raws.slice(-1)[0] === 'api/stream-raw/d2?quality=hd' && pvideo().getAttribute('src').startsWith('blob:'),
+          raws.join(','));
+    [...document.querySelectorAll('#player-body .quality button')].find((b) => b.textContent === 'SD').click();
+    await until(() => pbadge() && pbadge().dataset.mode === 'fast');
+
+    window.__aborted = [];
+    document.getElementById('player-close').click();
+    document.querySelector('#timeline .tl-seg[data-clip-id="d2"]').click();
+    await sleep(30);
+    document.getElementById('player-close').click();
+    await sleep(400);
+    check('closing mid-remux aborts the download', window.__aborted.length === 1, window.__aborted.join(','));
+    check('… and nothing is left playing', panel.hidden && !pvideo());
+    window.__rawDelay = 0;
+
+    // Reused <video> stays attached between clips (fullscreen survives autoplay).
+    segP1.isConnected || await search();
+    document.querySelector('#timeline .tl-seg[data-clip-id="p1"]').click();
+    const firstVideo = pvideo();
+    let detached = false;
+    const mo = new MutationObserver((recs) => {
+      for (const r of recs) for (const n of r.removedNodes) if (n === firstVideo) detached = true;
+    });
+    mo.observe(document.getElementById('player-body'), { childList: true });
+    nextBtn.click();
+    await until(() => playing() === 'd2');
+    await until(() => pbadge().dataset.mode !== 'working');
+    mo.disconnect();
+    check('the same <video> is reused and never detached between clips',
+          pvideo() === firstVideo && !detached, `same=${pvideo() === firstVideo} detached=${detached}`);
+    check('Download sits in the controls row',
+          !!document.querySelector('#player-body .clip-controls .download'));
+
+    // A failed search must not leave j/k pointing at clips no longer shown.
+    window.__recordingsStatus = 500;
+    await search();
+    window.__recordingsStatus = 200;
+    check('failed search: Earlier/Later disabled',
+          document.getElementById('next-clip').disabled && document.getElementById('prev-clip').disabled);
+    key(document.body, 'k');
+    await sleep(30);
+    check('failed search: k does nothing', playing() === 'd2', playing());
+    check('failed search: message shown', /failed upstream/.test(message.textContent), message.textContent);
 
     // Paging the list: 200 rows, then Show more; the timeline draws everything.
     const many = [];
