@@ -114,5 +114,6 @@ button.primary:disabled { opacity: 0.6; }
 }
 .mode-badge[data-mode="fast"]    { color: #3fb950; border-color: #238636; }
 .mode-badge[data-mode="compat"]  { color: #d29922; border-color: #9e6a03; }
+.mode-badge[data-mode="direct"]  { color: #58a6ff; border-color: #1f6feb; }
 .mode-badge[data-mode="working"] { color: var(--muted); }
 .mode-badge[data-mode="failed"]  { color: var(--bad); border-color: var(--bad); }

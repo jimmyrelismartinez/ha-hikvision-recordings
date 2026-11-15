@@ -72,7 +72,10 @@ def client_for(fake: FakeClient, **overrides) -> TestClient:
 def test_channels_come_from_options():
     with client_for(FakeClient()) as client:
         body = client.get("/api/channels").json()
-    assert body == [{"id": 101, "name": "DriveWay1"}, {"id": 401, "name": "ENTRYWAY"}]
+    assert body == [
+        {"id": "dvr-101", "key": "dvr-101", "name": "DriveWay1", "kind": "dvr"},
+        {"id": "dvr-401", "key": "dvr-401", "name": "ENTRYWAY", "kind": "dvr"},
+    ]
 
 
 def test_recordings_returns_clips_with_opaque_ids():

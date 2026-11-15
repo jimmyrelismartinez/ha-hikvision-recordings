@@ -208,13 +208,17 @@ def test_hd_serves_the_mainstream(endpoint, monkeypatch):
 
 
 @pytest.mark.parametrize("endpoint", ["api/stream", "api/stream-raw"])
-def test_hd_does_not_waste_a_substream_search(endpoint, monkeypatch):
-    """HD already holds the recording it wants; a second search is pure latency."""
+def test_playback_does_not_waste_a_substream_search(endpoint, monkeypatch):
+    """The substream is paired once at list time (v0.2.0); neither HD nor SD
+    playback may add a DVR search of its own when that pairing succeeded."""
     monkeypatch.setattr(main_module, "remux_to_fmp4", lambda src: src)
     fake = FakeClient()
     with _client(fake) as client:
-        client.get(f"/{endpoint}/{_clip_id(client)}", params={"quality": "hd"})
-    assert 102 not in fake.searched_channels
+        clip_id = _clip_id(client)
+        searches_after_listing = list(fake.searched_channels)
+        for quality in ("hd", "sd"):
+            client.get(f"/{endpoint}/{clip_id}", params={"quality": quality})
+    assert fake.searched_channels == searches_after_listing
 
 
 @pytest.mark.parametrize("endpoint", ["api/stream", "api/stream-raw"])
@@ -244,13 +248,23 @@ def test_unknown_quality_is_rejected(endpoint, bad, monkeypatch):
     assert not fake.downloaded_uris, "hit the DVR before validating the request"
 
 
-@pytest.mark.parametrize("quality", ["sd", "hd"])
-def test_download_ignores_quality_and_stays_on_the_mainstream(quality, monkeypatch):
-    """Download is always full quality, whatever the user picked for playback."""
+@pytest.mark.parametrize("params", [{}, {"quality": "hd"}])
+def test_download_defaults_to_full_quality(params, monkeypatch):
+    """Without asking (old frontends) or asking for HD: the full mainstream."""
     monkeypatch.setattr(main_module, "remux_to_fmp4", lambda src: src)
     fake = FakeClient()
     with _client(fake) as client:
-        response = client.get(f"/api/download/{_clip_id(client)}", params={"quality": quality})
+        response = client.get(f"/api/download/{_clip_id(client)}", params=params)
     assert response.status_code == 200
     assert response.content == MAIN_PAYLOAD, "download regressed to the substream"
     assert not any("/tracks/102/" in u for u in fake.downloaded_uris)
+
+
+def test_download_is_quality_aware_since_v0_2(monkeypatch):
+    """INVERTED in v0.2.0: SD download gives the substream the user picked."""
+    monkeypatch.setattr(main_module, "remux_to_fmp4", lambda src: src)
+    fake = FakeClient()
+    with _client(fake) as client:
+        response = client.get(f"/api/download/{_clip_id(client)}", params={"quality": "sd"})
+    assert response.status_code == 200
+    assert response.content == SUB_PAYLOAD

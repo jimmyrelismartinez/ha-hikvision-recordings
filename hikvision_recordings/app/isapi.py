@@ -52,6 +52,18 @@ class DvrBusy(DvrError):
     """The DVR is at its session limit or otherwise refusing more work."""
 
 
+class ClipGone(DvrError):
+    """The device no longer holds this recording (e.g. the SD card wrapped around)."""
+
+
+class RangeNotSatisfiable(DvrError):
+    """The requested byte range lies outside the recording. Carries Content-Range."""
+
+    def __init__(self, message: str, content_range: str | None = None) -> None:
+        super().__init__(message)
+        self.content_range = content_range
+
+
 @dataclass(frozen=True)
 class Recording:
     channel: int
