@@ -18,9 +18,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import AsyncIterator
+import os
+from collections import OrderedDict
+from typing import AsyncIterator, Awaitable, Callable
 
 LOG = logging.getLogger(__name__)
+
+# ffmpeg must not inherit SUPERVISOR_TOKEN (it parses untrusted device bytes).
+_FFMPEG_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
+
+# In-memory JPEG LRU — never written to disk (zero-persistence).
+THUMB_CACHE_MAX_BYTES = 32 * 1024 * 1024
+THUMB_CACHE_MAX_ENTRIES = 1000
 
 # ── WHY THE LAST FRAME IN THE BUDGET, NOT THE FIRST — AND NOT A FIXED TIME ───
 # Frame 0 of a motion-triggered recording is usually the empty scene just before
@@ -101,6 +110,76 @@ class ThumbnailError(Exception):
     """No decodable frame could be produced from the bytes we read."""
 
 
+class ThumbnailCache:
+    """In-memory LRU of successful JPEG thumbnails, single-flight per key.
+
+    Key is (camera_key, start_iso, ref_used) — not the clip id, which is minted
+    fresh on every search. Only successful JPEGs are cached; errors are not.
+    """
+
+    def __init__(
+        self,
+        max_bytes: int = THUMB_CACHE_MAX_BYTES,
+        max_entries: int = THUMB_CACHE_MAX_ENTRIES,
+    ) -> None:
+        self._max_bytes = max_bytes
+        self._max_entries = max_entries
+        self._entries: OrderedDict[tuple, bytes] = OrderedDict()
+        self._total_bytes = 0
+        self._inflight: dict[tuple, asyncio.Task] = {}
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
+
+    def get(self, key: tuple) -> bytes | None:
+        jpeg = self._entries.get(key)
+        if jpeg is None:
+            return None
+        self._entries.move_to_end(key)
+        return jpeg
+
+    def put(self, key: tuple, jpeg: bytes) -> None:
+        if key in self._entries:
+            self._total_bytes -= len(self._entries[key])
+            del self._entries[key]
+        self._entries[key] = jpeg
+        self._total_bytes += len(jpeg)
+        self._entries.move_to_end(key)
+        while (
+            len(self._entries) > self._max_entries
+            or self._total_bytes > self._max_bytes
+        ) and self._entries:
+            _, old = self._entries.popitem(last=False)
+            self._total_bytes -= len(old)
+
+    async def get_or_fetch(
+        self, key: tuple, fetch: Callable[[], Awaitable[bytes]]
+    ) -> bytes:
+        hit = self.get(key)
+        if hit is not None:
+            return hit
+        existing = self._inflight.get(key)
+        if existing is not None:
+            return await asyncio.shield(existing)
+
+        async def run() -> bytes:
+            jpeg = await fetch()
+            self.put(key, jpeg)
+            return jpeg
+
+        task = asyncio.create_task(run())
+        self._inflight[key] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+
+
 def split_jpegs(blob: bytes) -> list[bytes]:
     """Split concatenated JPEGs, keeping only the complete ones.
 
@@ -163,6 +242,7 @@ async def thumbnail_from_stream(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_FFMPEG_ENV,
     )
     try:
         stdout, stderr = await asyncio.wait_for(

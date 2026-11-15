@@ -23,6 +23,7 @@ from starlette.background import BackgroundTask
 
 from .clips import KIND_DVR, KIND_REOLINK, SUB_WINDOW_PAD, Clip, best_overlap
 from .config import Config, load_config_from_file
+from .ha import HaAuthError, HaBadEntity, HaClient, HaError, HaNotFound, HaUnreachable
 from .isapi import (
     ClipGone,
     DvrAuthError,
@@ -37,11 +38,20 @@ from .isapi import (
 from .reolink import ReolinkClient
 from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
-from .thumbnail import THUMB_MAX_BYTES, ThumbnailError, thumbnail_from_stream
+from .thumbnail import (
+    THUMB_MAX_BYTES,
+    ThumbnailCache,
+    ThumbnailError,
+    thumbnail_from_stream,
+)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
+
+# Supervisor ingress proxy + local loopback. Used only when SUPERVISOR_TOKEN was
+# present at startup (see IngressOnlyMiddleware).
+INGRESS_PEERS = frozenset({"172.30.32.2", "127.0.0.1"})
 
 # Where clips are staged for Range-capable playback. config.yaml sets `tmpfs: true`
 # so this is RAM inside the add-on container, never the Pi's disk.
@@ -140,6 +150,31 @@ ERROR_STATUS = {
 }
 
 
+class IngressOnlyMiddleware:
+    """When running under Supervisor, refuse peers that are not the ingress proxy.
+
+    Off when no SUPERVISOR_TOKEN was present (local dev / tests), so TestClient
+    and `uvicorn` on a laptop keep working without HA.
+    """
+
+    def __init__(self, app, enabled: bool) -> None:
+        self.app = app
+        self.enabled = enabled
+
+    async def __call__(self, scope, receive, send):
+        if self.enabled and scope["type"] == "http":
+            client = scope.get("client")
+            host = client[0] if client else None
+            if host not in INGRESS_PEERS:
+                await Response(
+                    content='{"detail":"Forbidden"}',
+                    status_code=403,
+                    media_type="application/json",
+                )(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def _http_error(exc: DvrError) -> HTTPException:
     for kind, status in ERROR_STATUS.items():
         if isinstance(exc, kind):
@@ -172,8 +207,17 @@ def create_app(
     config: Config,
     client: IsapiClient | None = None,
     reolink_clients: list | None = None,
+    ha_client: HaClient | None = None,
 ) -> FastAPI:
-    """Build the app. `client` / `reolink_clients` are injection points for tests."""
+    """Build the app. `client` / `reolink_clients` / `ha_client` are test injectors.
+
+    SUPERVISOR_TOKEN is read once here and removed from the environment so ffmpeg
+    subprocesses (and anything else) cannot inherit it.
+    """
+    token = os.environ.pop("SUPERVISOR_TOKEN", None)
+    ha = ha_client if ha_client is not None else HaClient(token)
+    ingress_only = token is not None
+
     dvr = (client or IsapiClient(config)) if config.dvr_configured else None
     reolinks = (
         reolink_clients if reolink_clients is not None else [
@@ -189,17 +233,24 @@ def create_app(
     if dvr is not None:
         for channel in config.channels:
             cameras[f"dvr-{channel.id}"] = {
-                "name": channel.name, "kind": KIND_DVR, "channel": channel.id}
+                "name": channel.name, "kind": KIND_DVR, "channel": channel.id,
+                "ha_camera": channel.ha_camera,
+            }
     for rc in reolinks:
-        cameras[rc.key] = {"name": rc.camera.name, "kind": KIND_REOLINK,
-                           "channel": rc.camera.channel}
+        cameras[rc.key] = {
+            "name": rc.camera.name, "kind": KIND_REOLINK,
+            "channel": rc.camera.channel, "ha_camera": rc.camera.ha_camera,
+        }
 
     # Sized so one all-cameras response can never evict its own newest clips
     # (goldfish B1); entries are also inserted oldest-first below.
+    # Floor raised to 2000 so an infinite-scroll day walk cannot FIFO-evict Today
+    # (design §10.1); put() also reuses ids for already-known clips.
     registry = ClipRegistry(
         dvr_host=config.dvr_host or None,
-        capacity=max(500, len(cameras) * config.max_search_results * 2),
+        capacity=max(2000, len(cameras) * config.max_search_results * 2),
     )
+    thumb_cache = ThumbnailCache()
     max_stage_bytes = config.max_stage_mb * 1024 * 1024
     # One search at a time per DVR: an all-cameras search would otherwise fire
     # 2 searches per channel at a device that answers "busy" to far less.
@@ -223,17 +274,23 @@ def create_app(
         await asyncio.gather(
             *([dvr.aclose()] if dvr is not None else []),
             *(rc.aclose() for rc in reolinks),
+            ha.aclose(),
             return_exceptions=True,
         )
 
     app = FastAPI(title="DVR Recordings", version=VERSION, lifespan=lifespan)
+    app.add_middleware(IngressOnlyMiddleware, enabled=ingress_only)
 
     @app.get("/api/channels")
     async def channels():
         # `id` is kept (now the key) so a cached pre-0.2 frontend still works: it
         # sends `channel=<id>`, which /api/recordings accepts.
+        # `snapshot` is true only when linked AND the HA client has a token.
         return [
-            {"id": key, "key": key, "name": cam["name"], "kind": cam["kind"]}
+            {
+                "id": key, "key": key, "name": cam["name"], "kind": cam["kind"],
+                "snapshot": bool(cam.get("ha_camera") and ha.enabled),
+            }
             for key, cam in cameras.items()
         ]
 
@@ -273,6 +330,8 @@ def create_app(
             "devices": devices,
             "version": VERSION,
             "client_remux_max_mb": config.client_remux_max_mb,
+            # No upstream call — just whether the Supervisor token was available.
+            "ha_api": "ok" if ha.enabled else "off",
         }
 
     # ── SEARCH ───────────────────────────────────────────────────────────────
@@ -336,6 +395,7 @@ def create_app(
                 end=rec.end, size_bytes=rec.size_bytes, main_ref=rec.playback_uri,
                 sub_ref=sub.playback_uri if sub else None,
                 sub_size_bytes=sub.size_bytes if sub else None,
+                events=rec.events,
             ))
         return clips, truncated
 
@@ -380,7 +440,41 @@ def create_app(
             "duration_s": clip.duration_s,
             "size_bytes": clip.size_bytes,
             "has_sub": clip.sub_ref is not None,
+            "events": list(clip.events),
         }
+
+    @app.get("/api/snapshot/{camera_key}")
+    async def snapshot(camera_key: str):
+        """Near-live still from Home Assistant's camera_proxy for a linked camera."""
+        cam = cameras.get(camera_key)
+        if cam is None:
+            raise HTTPException(status_code=404, detail="Unknown camera.")
+        entity = cam.get("ha_camera")
+        if not entity:
+            raise HTTPException(
+                status_code=404, detail="Not linked to a Home Assistant camera"
+            )
+        if not ha.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="Snapshots need the Home Assistant API (homeassistant_api)",
+            )
+        try:
+            body, content_type = await ha.snapshot(entity)
+        except HaNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except HaBadEntity as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (HaUnreachable, HaAuthError, HaError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.get("/api/recordings")
     async def recordings(
@@ -783,21 +877,38 @@ def create_app(
         rather than opening an unlimited side channel to the DVR — a list of 40
         rows could otherwise swamp it. A busy DVR therefore returns 503 here too,
         by the same path as the video endpoints.
+
+        Successful JPEGs are kept in an in-memory LRU keyed by
+        (camera_key, start, ref_used) so a re-list of the same clip does not
+        re-read the device. Errors are not cached.
         """
         clip = _lookup(clip_id)
         # The substream when one was paired at list time: about half the bytes on
         # the DVR (a fifth on the Reolink), so the same 2 MB read reaches further
         # into the clip and frees the device slot sooner. No per-thumbnail search.
-        upstream = None
+        ref_used = clip.sub_ref if clip.sub_ref else clip.main_ref
+        cache_key = (
+            clip.camera_key,
+            clip.start.isoformat().replace("+00:00", "Z"),
+            ref_used,
+        )
+
+        async def fetch() -> bytes:
+            upstream = None
+            try:
+                if clip.kind == KIND_REOLINK:
+                    upstream = await reolink_by_key[clip.camera_key].open(
+                        ref_used, f"bytes=0-{THUMB_MAX_BYTES - 1}")
+                    source = upstream.body
+                else:
+                    source = dvr.stream_download(ref_used)
+                return await thumbnail_from_stream(source)
+            finally:
+                if upstream is not None:
+                    await upstream.aclose()
+
         try:
-            if clip.kind == KIND_REOLINK:
-                upstream = await reolink_by_key[clip.camera_key].open(
-                    clip.sub_ref or clip.main_ref, f"bytes=0-{THUMB_MAX_BYTES - 1}")
-                source = upstream.body
-            else:
-                source = dvr.stream_download(
-                    clip.sub_ref if clip.sub_ref else clip.main_ref)
-            jpeg = await thumbnail_from_stream(source)
+            jpeg = await thumb_cache.get_or_fetch(cache_key, fetch)
         except DvrError as exc:
             raise _http_error(exc) from exc
         except ThumbnailError as exc:
@@ -807,9 +918,6 @@ def create_app(
             raise HTTPException(
                 status_code=502, detail="No preview available for this clip."
             ) from exc
-        finally:
-            if upstream is not None:
-                await upstream.aclose()
         return Response(
             content=jpeg,
             media_type="image/jpeg",
