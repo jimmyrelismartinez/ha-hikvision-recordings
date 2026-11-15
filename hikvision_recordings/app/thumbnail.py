@@ -173,11 +173,16 @@ class ThumbnailCache:
 
         task = asyncio.create_task(run())
         self._inflight[key] = task
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if self._inflight.get(key) is task:
-                self._inflight.pop(key, None)
+        task.add_done_callback(lambda t, k=key: self._finish(k, t))
+        return await asyncio.shield(task)
+
+    def _finish(self, key: tuple, task: asyncio.Task) -> None:
+        # The task clears its own slot — not the first caller, who may have
+        # disconnected while the shared fetch was still running.
+        if self._inflight.get(key) is task:
+            self._inflight.pop(key, None)
+        if not task.cancelled():
+            task.exception()    # mark retrieved even if every waiter left
 
 
 def split_jpegs(blob: bytes) -> list[bytes]:

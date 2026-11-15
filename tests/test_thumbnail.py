@@ -326,3 +326,29 @@ async def test_ffmpeg_subprocess_env_has_no_supervisor_token(monkeypatch, mpeg_p
     assert seen["env"] is not None
     assert "SUPERVISOR_TOKEN" not in seen["env"]
     assert "PATH" in seen["env"]
+
+
+@pytest.mark.asyncio
+async def test_cache_first_caller_cancelled_does_not_refetch():
+    import asyncio
+    from hikvision_recordings.app.thumbnail import ThumbnailCache
+
+    cache = ThumbnailCache()
+    calls = 0
+    release = asyncio.Event()
+
+    async def fetch():
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return b"jpeg"
+
+    first = asyncio.create_task(cache.get_or_fetch(("k",), fetch))
+    await asyncio.sleep(0.01)
+    first.cancel()
+    await asyncio.sleep(0.01)
+    second = asyncio.create_task(cache.get_or_fetch(("k",), fetch))
+    await asyncio.sleep(0.01)
+    release.set()
+    assert await second == b"jpeg"
+    assert calls == 1
