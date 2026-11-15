@@ -245,6 +245,7 @@ function setMode(badge, mode, detail) {
     working: 'Remuxing in browser…',
     fast: 'Fast · browser remux',
     compat: 'Compatibility · server remux',
+    direct: 'Direct · native MP4',
     failed: 'Playback failed',
   }[mode] || mode;
   badge.title = detail || '';
@@ -317,6 +318,7 @@ function buildPlayer(clip, body) {
       if (quality === q) return;
       quality = q;
       for (const [key, el] of buttons) el.classList.toggle('on', key === quality);
+      download.href = `api/download/${clip.id}?quality=${quality}`;
       play();
     });
     buttons.set(q, button);
@@ -334,8 +336,8 @@ function buildPlayer(clip, body) {
 
   const download = document.createElement('a');
   download.className = 'download';
-  // Download is always full-quality mainstream — deliberately NOT quality-aware.
-  download.href = `api/download/${clip.id}`;      // relative — see rule at top
+  // Download follows the SD/HD toggle (v0.2.0); the server defaults to HD.
+  download.href = `api/download/${clip.id}?quality=${quality}`;   // relative — see rule at top
   download.textContent = 'Download';
   download.setAttribute('download', '');
 
@@ -350,6 +352,16 @@ function buildPlayer(clip, body) {
 
   async function play() {
     if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+
+    if (clip.playback === 'direct') {
+      // Reolink: the camera already serves browser-playable MP4 and the add-on
+      // proxies it with Range — no ffmpeg anywhere, and seeking works.
+      setMode(badge, 'direct', 'camera MP4 proxied as-is — seeking works');
+      hint.textContent = '';
+      video.src = `api/stream/${clip.id}?quality=${quality}`;   // relative — see rule at top
+      video.play().catch(() => { /* iOS wants a second tap */ });
+      return;
+    }
 
     const blocker = clientRemuxBlocker(clip);
     if (blocker) {

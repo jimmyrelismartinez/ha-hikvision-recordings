@@ -6,6 +6,7 @@ stores a byte of it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -20,21 +21,25 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
+from .clips import KIND_DVR, KIND_REOLINK, SUB_WINDOW_PAD, Clip, best_overlap
 from .config import Config, load_config_from_file
 from .isapi import (
+    ClipGone,
     DvrAuthError,
     DvrBadRequest,
     DvrBusy,
     DvrError,
     DvrUnreachable,
     IsapiClient,
+    RangeNotSatisfiable,
     Recording,
 )
+from .reolink import ReolinkClient
 from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
-from .thumbnail import ThumbnailError, thumbnail_from_stream
+from .thumbnail import THUMB_MAX_BYTES, ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.1.7"
+VERSION = "0.2.0"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -75,10 +80,11 @@ def _sweep_stale_stages() -> None:
 # Playback quality the caller may ask for. "sd" = the DVR's independently recorded
 # substream, "hd" = the mainstream. SD is the default because it is roughly half the
 # bytes and therefore materially faster to fetch on both playback paths.
-# NOTE: /api/download is deliberately NOT quality-aware — it always serves the full
-# mainstream, whatever the user picked for playback.
+# /api/download became quality-aware in v0.2.0 but defaults to "hd", so any caller
+# that does not ask still gets the full mainstream, exactly as before.
 QUALITIES = ("sd", "hd")
 DEFAULT_QUALITY = "sd"
+DEFAULT_DOWNLOAD_QUALITY = "hd"
 
 
 def _check_quality(quality: str) -> None:
@@ -125,6 +131,8 @@ class _CachePolicyStatic(StaticFiles):
 
 
 ERROR_STATUS = {
+    ClipGone: 410,
+    RangeNotSatisfiable: 416,
     DvrAuthError: 401,
     DvrUnreachable: 502,
     DvrBadRequest: 502,
@@ -135,7 +143,10 @@ ERROR_STATUS = {
 def _http_error(exc: DvrError) -> HTTPException:
     for kind, status in ERROR_STATUS.items():
         if isinstance(exc, kind):
-            return HTTPException(status_code=status, detail=str(exc))
+            headers = None
+            if isinstance(exc, RangeNotSatisfiable) and exc.content_range:
+                headers = {"Content-Range": exc.content_range}
+            return HTTPException(status_code=status, detail=str(exc), headers=headers)
     return HTTPException(status_code=502, detail=str(exc))
 
 
@@ -151,104 +162,320 @@ def _parse_utc(value: str, field: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _safe_filename(channel_name: str, recording: Recording, extension: str) -> str:
+def _safe_filename(channel_name: str, recording: Recording | Clip, extension: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_-]+", "_", channel_name).strip("_") or "camera"
     stamp = recording.start.strftime("%Y-%m-%d_%H-%M-%S")
     return f"{slug}_{stamp}{extension}"
 
 
-def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
-    names = {channel.id: channel.name for channel in config.channels}
-    registry = ClipRegistry(dvr_host=config.dvr_host)
+def create_app(
+    config: Config,
+    client: IsapiClient | None = None,
+    reolink_clients: list | None = None,
+) -> FastAPI:
+    """Build the app. `client` / `reolink_clients` are injection points for tests."""
+    dvr = (client or IsapiClient(config)) if config.dvr_configured else None
+    reolinks = (
+        reolink_clients if reolink_clients is not None else [
+            ReolinkClient(camera, f"reolink-{index}", config.max_concurrent_downloads)
+            for index, camera in enumerate(config.reolink_cameras)
+        ]
+    )
+    reolink_by_key = {rc.key: rc for rc in reolinks}
+
+    # Every camera, DVR channel or Reolink, is addressed by a string key — integer
+    # channel ids collide across devices.
+    cameras: dict[str, dict] = {}
+    if dvr is not None:
+        for channel in config.channels:
+            cameras[f"dvr-{channel.id}"] = {
+                "name": channel.name, "kind": KIND_DVR, "channel": channel.id}
+    for rc in reolinks:
+        cameras[rc.key] = {"name": rc.camera.name, "kind": KIND_REOLINK,
+                           "channel": rc.camera.channel}
+
+    # Sized so one all-cameras response can never evict its own newest clips
+    # (goldfish B1); entries are also inserted oldest-first below.
+    registry = ClipRegistry(
+        dvr_host=config.dvr_host or None,
+        capacity=max(500, len(cameras) * config.max_search_results * 2),
+    )
     max_stage_bytes = config.max_stage_mb * 1024 * 1024
-    dvr = client or IsapiClient(config)
+    # One search at a time per DVR: an all-cameras search would otherwise fire
+    # 2 searches per channel at a device that answers "busy" to far less.
+    dvr_search_sem = asyncio.Semaphore(1)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        try:
-            await dvr.probe_clock()
-        except Exception as exc:  # noqa: BLE001 — never block startup on the DVR
-            LOG.warning("clock probe failed at startup: %s", exc)
+        async def probe(device, label):
+            try:
+                await device.probe_clock()
+            except Exception as exc:  # noqa: BLE001 — never block startup on a device
+                LOG.warning("clock probe failed at startup for %s: %s", label, exc)
+
+        if dvr is None:
+            LOG.info("DVR not configured (dvr_host is blank) — Reolink cameras only")
+        await asyncio.gather(
+            *([probe(dvr, "the DVR")] if dvr is not None else []),
+            *(probe(rc, rc.camera.name) for rc in reolinks),
+        )
         yield
-        await dvr.aclose()
+        await asyncio.gather(
+            *([dvr.aclose()] if dvr is not None else []),
+            *(rc.aclose() for rc in reolinks),
+            return_exceptions=True,
+        )
 
     app = FastAPI(title="DVR Recordings", version=VERSION, lifespan=lifespan)
 
     @app.get("/api/channels")
     async def channels():
-        return [{"id": c.id, "name": c.name} for c in config.channels]
+        # `id` is kept (now the key) so a cached pre-0.2 frontend still works: it
+        # sends `channel=<id>`, which /api/recordings accepts.
+        return [
+            {"id": key, "key": key, "name": cam["name"], "kind": cam["kind"]}
+            for key, cam in cameras.items()
+        ]
+
+    async def _device_state(device) -> str:
+        try:
+            await device.ping()
+        except DvrAuthError:
+            return "auth_failed"
+        except DvrError:
+            return "unreachable"
+        return "ok"
 
     @app.get("/api/health")
     async def health():
-        state = "ok"
-        try:
-            # A ping, not a search: a zero-width timeSpan has unknown firmware
-            # behaviour and could make a healthy DVR look unreachable.
-            await dvr.ping()
-        except DvrAuthError:
-            state = "auth_failed"
-        except DvrError:
-            state = "unreachable"
+        devices_list = ([("dvr", KIND_DVR, "DVR", dvr)] if dvr is not None else []) + [
+            (rc.key, KIND_REOLINK, rc.camera.name, rc) for rc in reolinks
+        ]
+        states = await asyncio.gather(*(_device_state(d[3]) for d in devices_list))
+        devices = []
+        for (prefix, kind, name, device), state in zip(devices_list, states):
+            clock = device.clock
+            devices.append({
+                "prefix": prefix, "kind": kind, "name": name, "state": state,
+                "clock_offset_s": int(clock.offset.total_seconds()),
+                "clock_source": clock.source,
+            })
+        primary = dvr if dvr is not None else (reolinks[0] if reolinks else None)
+        clock = primary.clock if primary is not None else None
         return {
-            "dvr": state,
+            "dvr": states[0] if dvr is not None else "not_configured",
             # Offset actually applied to queries, plus how far the device's clock sits
             # from a whole-hour zone (i.e. the part that is a wrong clock, not a zone).
-            "clock_offset_s": int(dvr.clock.offset.total_seconds()),
-            "clock_source": dvr.clock.source,
-            "clock_drift_s": int(getattr(dvr.clock, "drift", timedelta(0)).total_seconds()),
+            "clock_offset_s": int(clock.offset.total_seconds()) if clock else 0,
+            "clock_source": clock.source if clock else "none",
+            "clock_drift_s": int(getattr(clock, "drift", timedelta(0)).total_seconds())
+            if clock else 0,
+            "devices": devices,
             "version": VERSION,
             "client_remux_max_mb": config.client_remux_max_mb,
         }
 
+    # ── SEARCH ───────────────────────────────────────────────────────────────
+    async def _dvr_search_paged(channel: int, start_utc: datetime, end_utc: datetime):
+        """Every recording in the window, by TIME CURSOR — not searchResultPosition.
+
+        Verified live 2026-11-14 (verify_dvr_contract.py Q5): this DVR IGNORES
+        searchResultPosition (positions 0..140 all return the same first page and
+        always say MORE) and caps one search at 64 items whatever maxResults says.
+        Results come back oldest first, so the next page is a fresh search starting
+        at the last item's start; overlap is deduped by playbackURI. A short page
+        ends the walk; a full page that brings nothing new means many clips share
+        one start time and the rest are unreachable, so the result is truncated.
+        """
+        page = max(1, min(config.max_results, 50))
+        found: dict[str, Recording] = {}
+        cursor = start_utc
+        truncated = False
+        while True:
+            async with dvr_search_sem:
+                batch = await dvr.search(channel, cursor, end_utc, page)
+            new = [r for r in batch if r.playback_uri not in found]
+            for r in new:
+                found[r.playback_uri] = r
+            if len(found) >= config.max_search_results:
+                truncated = len(found) > config.max_search_results or len(batch) >= page
+                break
+            if len(batch) < page:
+                break
+            if not new:
+                truncated = True
+                break
+            next_cursor = max(r.start for r in batch)
+            if next_cursor <= cursor:
+                truncated = True
+                break
+            cursor = next_cursor
+        recordings = sorted(found.values(), key=lambda r: r.start)
+        return recordings[: config.max_search_results], truncated
+
+    async def _search_dvr_camera(key: str, start_utc: datetime, end_utc: datetime):
+        channel = cameras[key]["channel"]
+        mains, truncated = await _dvr_search_paged(channel, start_utc, end_utc)
+        # One substream search for the whole window, instead of one per play, so SD
+        # playback and thumbnails need no extra DVR search. Padded like the per-play
+        # lookup. Failure here only costs the pairing — SD then falls back per play.
+        subs: list[Recording] = []
+        if mains:
+            try:
+                subs, _ = await _dvr_search_paged(
+                    channel + SUBSTREAM_STREAM_TYPE_OFFSET,
+                    start_utc - SUB_WINDOW_PAD, end_utc + SUB_WINDOW_PAD,
+                )
+            except DvrError as exc:
+                LOG.warning("substream search failed for channel %s (%s)", channel, exc)
+        clips = []
+        for rec in mains:
+            sub = best_overlap(rec.start, rec.end, subs)
+            clips.append(Clip(
+                camera_key=key, kind=KIND_DVR, channel=rec.channel, start=rec.start,
+                end=rec.end, size_bytes=rec.size_bytes, main_ref=rec.playback_uri,
+                sub_ref=sub.playback_uri if sub else None,
+                sub_size_bytes=sub.size_bytes if sub else None,
+            ))
+        return clips, truncated
+
+    async def _search_camera(key: str, start_utc: datetime, end_utc: datetime):
+        if cameras[key]["kind"] == KIND_DVR:
+            return await _search_dvr_camera(key, start_utc, end_utc)
+        return await reolink_by_key[key].search(start_utc, end_utc, config.max_search_results)
+
+    def _resolve_cameras(requested: list[str]) -> list[str]:
+        keys: list[str] = []
+        for raw in requested:
+            for part in str(raw).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if part == "all":
+                    keys.extend(cameras)
+                    continue
+                if part.isdigit():          # legacy `channel=101`
+                    part = f"dvr-{part}"
+                if part not in cameras:
+                    raise HTTPException(status_code=400, detail="Unknown camera.")
+                keys.append(part)
+        if not keys:
+            raise HTTPException(status_code=400, detail="Pick at least one camera.")
+        return list(dict.fromkeys(keys))
+
+    def _clip_json(clip_id: str, clip: Clip) -> dict:
+        name = cameras[clip.camera_key]["name"]
+        return {
+            "id": clip_id,
+            "channel": clip.camera_key,
+            "camera_key": clip.camera_key,
+            "channel_name": name,
+            "camera_name": name,
+            "kind": clip.kind,
+            # "direct": the device already serves browser-playable MP4 with Range
+            # (Reolink) — no remux on either side. "remux": Hikvision MPEG-PS.
+            "playback": "direct" if clip.kind == KIND_REOLINK else "remux",
+            "start": clip.start.isoformat().replace("+00:00", "Z"),
+            "end": clip.end.isoformat().replace("+00:00", "Z"),
+            "duration_s": clip.duration_s,
+            "size_bytes": clip.size_bytes,
+            "has_sub": clip.sub_ref is not None,
+        }
+
     @app.get("/api/recordings")
     async def recordings(
-        channel: int = Query(...),
         start: str = Query(...),
         end: str = Query(...),
+        camera: list[str] | None = Query(None),
+        channel: str | None = Query(None),
     ):
-        if channel not in names:
-            raise HTTPException(status_code=400, detail="Unknown channel.")
+        keys = _resolve_cameras(list(camera or []) + ([channel] if channel else []))
         start_utc = _parse_utc(start, "start")
         end_utc = _parse_utc(end, "end")
         if end_utc <= start_utc:
             raise HTTPException(status_code=400, detail="The end time must be after the start time.")
-        try:
-            found = await dvr.search(channel, start_utc, end_utc)
-        except DvrError as exc:
-            raise _http_error(exc) from exc
 
-        # Newest first. Note: this only reorders what the DVR already returned —
-        # it does not change which clips were selected before truncation (see
-        # `truncated` below); a full fix would need DVR-side paging.
-        found = sorted(found, key=lambda r: r.start, reverse=True)
-
-        clips = []
-        for recording in found:
-            try:
-                clip_id = registry.put(recording)
-            except InvalidPlaybackUri:
-                LOG.warning("dropping a search result with an unexpected playbackURI host")
+        # Cameras on different devices search concurrently; within a device the
+        # search semaphore serialises them. One device being down must not cost
+        # the user the others, so DvrErrors become per-camera `errors` entries.
+        outcomes = await asyncio.gather(
+            *(_search_camera(key, start_utc, end_utc) for key in keys),
+            return_exceptions=True,
+        )
+        found: list[Clip] = []
+        errors: list[tuple[str, DvrError]] = []
+        truncated_cameras: list[str] = []
+        for key, outcome in zip(keys, outcomes):
+            if isinstance(outcome, DvrError):
+                errors.append((key, outcome))
                 continue
-            clips.append(
-                {
-                    "id": clip_id,
-                    "channel": recording.channel,
-                    "channel_name": names[recording.channel],
-                    "start": recording.start.isoformat().replace("+00:00", "Z"),
-                    "end": recording.end.isoformat().replace("+00:00", "Z"),
-                    "duration_s": recording.duration_s,
-                    "size_bytes": recording.size_bytes,
-                }
-            )
-        return {"clips": clips, "truncated": len(found) >= config.max_results}
+            if isinstance(outcome, BaseException):
+                raise outcome            # a bug, not a device failure — don't hide it
+            clips, truncated = outcome
+            found.extend(clips)
+            if truncated:
+                truncated_cameras.append(key)
+        if errors and len(errors) == len(keys):
+            raise _http_error(errors[0][1]) from errors[0][1]
 
-    def _lookup(clip_id: str) -> Recording:
+        # Register oldest first, so if capacity is ever exceeded the registry evicts
+        # the oldest clips of this response, never the newest. Return newest first.
+        found.sort(key=lambda c: c.start)
+        listed = []
+        for clip in found:
+            try:
+                clip_id = registry.put(clip)
+            except InvalidPlaybackUri:
+                LOG.warning("dropping a search result with an unexpected ref")
+                continue
+            listed.append(_clip_json(clip_id, clip))
+        listed.reverse()
+        return {
+            "clips": listed,
+            "truncated": bool(truncated_cameras),
+            "truncated_cameras": truncated_cameras,
+            "errors": [{"camera": key, "detail": str(exc)} for key, exc in errors],
+        }
+
+    def _lookup(clip_id: str) -> Clip:
         try:
             return registry.get(clip_id)
         except ClipExpired as exc:
             raise HTTPException(
                 status_code=410, detail="That result expired — search again."
             ) from exc
+
+    def _as_recording(clip: Clip, sub: bool = False) -> Recording:
+        """The DVR code paths below predate Clip and speak Recording."""
+        if sub:
+            return Recording(channel=clip.channel + SUBSTREAM_STREAM_TYPE_OFFSET,
+                             start=clip.start, end=clip.end,
+                             size_bytes=clip.sub_size_bytes or 0, playback_uri=clip.sub_ref)
+        return Recording(channel=clip.channel, start=clip.start, end=clip.end,
+                         size_bytes=clip.size_bytes, playback_uri=clip.main_ref)
+
+    def _reolink_ref(clip: Clip, quality: str) -> str:
+        return clip.sub_ref if quality == "sd" and clip.sub_ref else clip.main_ref
+
+    async def _open_reolink(clip: Clip, ref: str, range_header: str | None, clamp: bool):
+        try:
+            return await reolink_by_key[clip.camera_key].open(ref, range_header, clamp=clamp)
+        except DvrError as exc:
+            raise _http_error(exc) from exc
+
+    def _reolink_response(upstream, extra_headers: dict | None = None) -> StreamingResponse:
+        headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store", **(extra_headers or {})}
+        for name in ("content-length", "content-range"):
+            if name in upstream.headers:
+                headers[name.title()] = upstream.headers[name]
+        return StreamingResponse(
+            upstream.body,
+            status_code=upstream.status,
+            # The firmware labels MP4 as "apolication/octet-stream" (sic).
+            media_type="video/mp4",
+            headers=headers,
+            background=BackgroundTask(upstream.aclose),
+        )
 
     async def _open_video_stream(recording: Recording, raw: bool, request: Request):
         """Start the pipeline and pull the first chunk *before* the response begins.
@@ -321,9 +548,6 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
     # deliberately records the channel we ASKED for and ignores that element, so
     # nothing here trusts the mislabel. Do not add code that reads it.
     SUBSTREAM_STREAM_TYPE_OFFSET = 1
-    # Main and sub recordings for the same event start/stop at slightly different
-    # instants, so widen the window before matching by overlap.
-    SUBSTREAM_WINDOW_PAD = timedelta(seconds=30)
 
     async def _substream_for(recording: Recording) -> Recording | None:
         """Find the substream counterpart of a mainstream clip, or None.
@@ -337,8 +561,8 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         try:
             candidates = await dvr.search(
                 sub_channel,
-                recording.start - SUBSTREAM_WINDOW_PAD,
-                recording.end + SUBSTREAM_WINDOW_PAD,
+                recording.start - SUB_WINDOW_PAD,
+                recording.end + SUB_WINDOW_PAD,
             )
         except DvrError as exc:
             LOG.warning("substream search failed for channel %s (%s)", sub_channel, exc)
@@ -346,12 +570,7 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
 
         # Pick the candidate overlapping the mainstream clip the most — a padded
         # window can legitimately return the neighbouring event as well.
-        best: Recording | None = None
-        best_overlap = timedelta(0)
-        for candidate in candidates:
-            overlap = min(candidate.end, recording.end) - max(candidate.start, recording.start)
-            if overlap > best_overlap:
-                best, best_overlap = candidate, overlap
+        best = best_overlap(recording.start, recording.end, candidates)
         if best is None:
             return None
         try:
@@ -362,7 +581,7 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             return None
         return best
 
-    async def _playback_for_quality(recording: Recording, quality: str) -> Recording:
+    async def _playback_for_quality(clip: Clip, quality: str) -> Recording:
         """Resolve which recording to actually fetch for the requested quality.
 
         `sd` -> the independently recorded substream (smaller, faster). `hd` -> the
@@ -378,8 +597,13 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         line, never an error — the user asked for SD as a speed preference, not as a
         precondition, so a channel without one must still play.
         """
+        recording = _as_recording(clip)
         if quality == "hd":
             return recording
+        if clip.sub_ref:
+            # Paired at list time (one sub search per list, not per play), and
+            # already validated by registry.put().
+            return _as_recording(clip, sub=True)
         playback = await _substream_for(recording)
         if playback is None:
             LOG.info(
@@ -398,8 +622,16 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         it is the safety net, so it must keep working exactly as it did in v0.1.3.
         """
         _check_quality(quality)
-        recording = _lookup(clip_id)
-        playback = await _playback_for_quality(recording, quality)
+        clip = _lookup(clip_id)
+        if clip.kind == KIND_REOLINK:
+            # Already browser-playable MP4 with moov up front: proxy the bytes with
+            # Range passthrough. No remux, no staging. Every open-ended range is
+            # clamped to one slice so a paused <video> cannot hold the camera's
+            # connection slot (goldfish B2).
+            upstream = await _open_reolink(
+                clip, _reolink_ref(clip, quality), request.headers.get("range"), clamp=True)
+            return _reolink_response(upstream)
+        playback = await _playback_for_quality(clip, quality)
         # Staged to a RAM-backed file rather than streamed, so the response carries
         # Content-Length and answers Range — without which iOS refuses to play at
         # all. See _stage_clip() for the full reasoning and the cleanup guarantees.
@@ -429,8 +661,13 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         max_concurrent_downloads budget and surfaces the same 503 when saturated.
         """
         _check_quality(quality)
-        recording = _lookup(clip_id)
-        playback = await _playback_for_quality(recording, quality)
+        clip = _lookup(clip_id)
+        if clip.kind == KIND_REOLINK:
+            raise HTTPException(
+                status_code=409,
+                detail="This camera already serves playable MP4 — use api/stream.",
+            )
+        playback = await _playback_for_quality(clip, quality)
         body = await _open_video_stream(playback, raw=True, request=request)
         return StreamingResponse(
             body,
@@ -509,11 +746,24 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         return path
 
     @app.get("/api/download/{clip_id}")
-    async def download(clip_id: str, request: Request, raw: int = 0):
-        recording = _lookup(clip_id)
+    async def download(
+        clip_id: str, request: Request, raw: int = 0,
+        quality: str = Query(DEFAULT_DOWNLOAD_QUALITY),
+    ):
+        _check_quality(quality)
+        clip = _lookup(clip_id)
+        name = cameras.get(clip.camera_key, {}).get("name", "camera")
+        if clip.kind == KIND_REOLINK:
+            # Already MP4, so `raw` has nothing to skip. Not clamped: a download is
+            # read continuously; the stall watchdog still frees an abandoned one.
+            upstream = await _open_reolink(clip, _reolink_ref(clip, quality), None, clamp=False)
+            filename = _safe_filename(name, clip, ".mp4")
+            return _reolink_response(
+                upstream, {"Content-Disposition": f'attachment; filename="{filename}"'})
+        recording = await _playback_for_quality(clip, quality)
         extension = ".mpg" if raw else ".mp4"
         media_type = "video/mpeg" if raw else "video/mp4"
-        filename = _safe_filename(names.get(recording.channel, "camera"), recording, extension)
+        filename = _safe_filename(name, recording, extension)
         body = await _open_video_stream(recording, raw=bool(raw), request=request)
         return StreamingResponse(
             body,
@@ -534,9 +784,19 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
         rows could otherwise swamp it. A busy DVR therefore returns 503 here too,
         by the same path as the video endpoints.
         """
-        recording = _lookup(clip_id)
-        source = dvr.stream_download(recording.playback_uri)
+        clip = _lookup(clip_id)
+        # The substream when one was paired at list time: about half the bytes on
+        # the DVR (a fifth on the Reolink), so the same 2 MB read reaches further
+        # into the clip and frees the device slot sooner. No per-thumbnail search.
+        upstream = None
         try:
+            if clip.kind == KIND_REOLINK:
+                upstream = await reolink_by_key[clip.camera_key].open(
+                    clip.sub_ref or clip.main_ref, f"bytes=0-{THUMB_MAX_BYTES - 1}")
+                source = upstream.body
+            else:
+                source = dvr.stream_download(
+                    clip.sub_ref if clip.sub_ref else clip.main_ref)
             jpeg = await thumbnail_from_stream(source)
         except DvrError as exc:
             raise _http_error(exc) from exc
@@ -547,6 +807,9 @@ def create_app(config: Config, client: IsapiClient | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=502, detail="No preview available for this clip."
             ) from exc
+        finally:
+            if upstream is not None:
+                await upstream.aclose()
         return Response(
             content=jpeg,
             media_type="image/jpeg",

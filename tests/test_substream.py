@@ -170,17 +170,26 @@ def test_download_still_uses_the_mainstream_unchanged():
     assert response.content == MAIN_PAYLOAD, "download regressed to the substream"
     assert any("/tracks/101/" in u for u in fake.downloaded_uris)
     assert not any("/tracks/102/" in u for u in fake.downloaded_uris)
-    assert 102 not in fake.searched_channels, "download should not even look up a substream"
 
 
-def test_recordings_list_and_thumbnails_stay_on_the_mainstream():
-    """Listing/thumbnails must describe what Download gives you, so: mainstream."""
+def test_listing_pairs_the_substream_once_and_thumbnails_use_it():
+    """INVERTED in v0.2.0. Download became quality-aware, so the old reason for
+    mainstream thumbnails ("match what Download gives you") is gone. The list now
+    pairs each clip with its substream in ONE extra search, and the preview reads
+    the substream — about half the bytes, no per-thumbnail search."""
     fake = FakeClient()
     with _client(fake) as client:
         clip = _clip_id(client)
         client.get(f"/api/thumbnail/{clip}")
-    assert fake.searched_channels == [101], "listing/thumbnail touched a substream track"
-    assert all("/tracks/101/" in u for u in fake.downloaded_uris)
+    assert fake.searched_channels == [101, 102]
+    assert fake.downloaded_uris and all("/tracks/102/" in u for u in fake.downloaded_uris)
+
+
+def test_thumbnail_uses_the_mainstream_when_no_substream_was_paired():
+    fake = FakeClient(substream_results=[])
+    with _client(fake) as client:
+        client.get(f"/api/thumbnail/{_clip_id(client)}")
+    assert fake.downloaded_uris and all("/tracks/101/" in u for u in fake.downloaded_uris)
 
 
 def test_substream_uri_from_a_foreign_host_is_rejected_and_falls_back():

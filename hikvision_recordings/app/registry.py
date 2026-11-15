@@ -1,8 +1,12 @@
-"""In-memory map of opaque clip ids → Recording.
+"""In-memory map of opaque clip ids → Clip.
 
 This is the trust boundary. The browser never sees a playbackURI and therefore
 cannot ask the backend to fetch an arbitrary URL — it can only name an id that
 this process minted from a real search result. Nothing here touches disk.
+
+Every ref is re-validated by the rules of the device family that produced it:
+a Hikvision playbackURI must point at the configured DVR, a Reolink ref must be a
+file name of the exact shape that camera's SD card uses.
 """
 from __future__ import annotations
 
@@ -13,7 +17,12 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from .isapi import Recording
+import logging
+
+from .clips import KIND_DVR, KIND_REOLINK, Clip
+from .reolink import InvalidReolinkRef, validate_reolink_ref
+
+LOG = logging.getLogger(__name__)
 
 DEFAULT_TTL_S = 3600.0
 DEFAULT_CAPACITY = 500
@@ -24,19 +33,19 @@ class ClipExpired(KeyError):
 
 
 class InvalidPlaybackUri(ValueError):
-    """A playbackURI that does not point at the configured DVR. Never fetched."""
+    """A ref that does not point at a configured device. Never fetched."""
 
 
 @dataclass
 class _Entry:
-    recording: Recording
+    clip: Clip
     expires_at: float
 
 
 class ClipRegistry:
     def __init__(
         self,
-        dvr_host: str,
+        dvr_host: str | None = None,
         ttl_s: float = DEFAULT_TTL_S,
         capacity: int = DEFAULT_CAPACITY,
     ) -> None:
@@ -48,8 +57,10 @@ class ClipRegistry:
         # search response, re-validate it before it can ever be sent back.
         # Use fullmatch to anchor the entire string (prefix AND suffix).
         # Query string is restricted to conservative allowlist to reject CR/LF/NUL.
+        # No DVR configured (Reolink-only install) -> nothing can match.
         self._pattern = re.compile(
             rf"^rtsp://{re.escape(dvr_host)}(?::\d+)?/Streaming/tracks/\d+/\?[A-Za-z0-9=&%._:+-]*\Z"
+            if dvr_host else r"(?!)"
         )
 
     def __len__(self) -> int:
@@ -84,23 +95,43 @@ class ClipRegistry:
                 f"set dvr_host to that IP"
             )
 
-    def put(self, recording: Recording) -> str:
-        self.validate_uri(recording.playback_uri)
+    def validate_ref(self, kind: str, ref: str) -> None:
+        """Raise InvalidPlaybackUri unless `ref` is valid for its device family."""
+        if kind == KIND_DVR:
+            self.validate_uri(ref)
+        elif kind == KIND_REOLINK:
+            try:
+                validate_reolink_ref(ref)
+            except InvalidReolinkRef as exc:
+                raise InvalidPlaybackUri(str(exc)) from exc
+        else:
+            raise InvalidPlaybackUri(f"unknown device kind {kind!r}")
+
+    def put(self, clip: Clip) -> str:
+        self.validate_ref(clip.kind, clip.main_ref)
+        if clip.sub_ref is not None:
+            try:
+                self.validate_ref(clip.kind, clip.sub_ref)
+            except InvalidPlaybackUri:
+                # A bad substream must not cost the user the clip — it just plays
+                # (and previews) from the mainstream instead.
+                LOG.warning("dropping an invalid substream ref; using the mainstream")
+                clip = clip.with_sub(None, None)
         self._purge()
         clip_id = secrets.token_urlsafe(12)
-        self._entries[clip_id] = _Entry(recording, time.monotonic() + self._ttl_s)
+        self._entries[clip_id] = _Entry(clip, time.monotonic() + self._ttl_s)
         while len(self._entries) > self._capacity:
             self._entries.popitem(last=False)
         return clip_id
 
-    def get(self, clip_id: str) -> Recording:
+    def get(self, clip_id: str) -> Clip:
         entry = self._entries.get(clip_id)
         if entry is None:
             raise ClipExpired(clip_id)
         if entry.expires_at <= time.monotonic():
             self._entries.pop(clip_id, None)
             raise ClipExpired(clip_id)
-        return entry.recording
+        return entry.clip
 
     def _purge(self) -> None:
         now = time.monotonic()

@@ -30,6 +30,25 @@ class Channel:
 
 
 @dataclass(frozen=True)
+class ReolinkCamera:
+    """A standalone Reolink camera that records to its own SD card (HTTP API, not ISAPI)."""
+
+    name: str
+    host: str
+    username: str
+    password: str = field(repr=False)
+    port: int = 80
+    use_https: bool = False
+    verify_ssl: bool = False
+    channel: int = 0
+
+    @property
+    def base_url(self) -> str:
+        scheme = "https" if self.use_https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+
+@dataclass(frozen=True)
 class Config:
     dvr_host: str
     dvr_username: str
@@ -43,6 +62,15 @@ class Config:
     max_stage_mb: int = 256
     client_remux_max_mb: int = 128
     log_level: str = "info"
+    # Hard cap on clips per camera per search, across all time-cursor pages. Bounds
+    # DVR load and the size of one response; the old max_results is the PAGE size.
+    max_search_results: int = 500
+    reolink_cameras: tuple[ReolinkCamera, ...] = ()
+
+    @property
+    def dvr_configured(self) -> bool:
+        """False in a Reolink-only install (blank dvr_host)."""
+        return bool(self.dvr_host)
 
     @property
     def base_url(self) -> str:
@@ -57,20 +85,56 @@ def _required(raw: dict, key: str) -> str:
     return value
 
 
-def load_config(raw: dict) -> Config:
-    host = _required(raw, "dvr_host")
-    username = _required(raw, "dvr_username")
-    password = _required(raw, "dvr_password")
-
-    channels = tuple(
-        Channel(id=int(c["id"]), name=str(c["name"]).strip())
-        for c in (raw.get("channels") or [])
-    )
-    if not channels:
-        raise ConfigError(
-            "no channels configured — add at least one channel row "
-            "(id like 101, name like 'Driveway')"
+def _reolink_cameras(raw: dict) -> tuple[ReolinkCamera, ...]:
+    cameras = []
+    for index, row in enumerate(raw.get("reolink_cameras") or []):
+        where = f"reolink_cameras[{index}]"
+        name = str(row.get("name", "") or "").strip()
+        host = str(row.get("host", "") or "").strip()
+        username = str(row.get("username", "") or "").strip()
+        password = str(row.get("password", "") or "")
+        for key, value in (("name", name), ("host", host),
+                           ("username", username), ("password", password)):
+            if not value:
+                raise ConfigError(f"{where}.{key} is empty — set it in the add-on configuration")
+        cameras.append(
+            ReolinkCamera(
+                name=name,
+                host=host,
+                username=username,
+                password=password,
+                port=int(row.get("port") or 80),
+                use_https=bool(row.get("use_https", False)),
+                verify_ssl=bool(row.get("verify_ssl", False)),
+                channel=int(row.get("channel") or 0),
+            )
         )
+    return tuple(cameras)
+
+
+def load_config(raw: dict) -> Config:
+    reolink = _reolink_cameras(raw)
+    host = str(raw.get("dvr_host", "") or "").strip()
+
+    if host or not reolink:
+        # The DVR stays mandatory unless at least one Reolink camera is configured,
+        # so an existing install with a blank field still fails loudly, as before.
+        host = _required(raw, "dvr_host")
+        username = _required(raw, "dvr_username")
+        password = _required(raw, "dvr_password")
+        channels = tuple(
+            Channel(id=int(c["id"]), name=str(c["name"]).strip())
+            for c in (raw.get("channels") or [])
+        )
+        if not channels:
+            raise ConfigError(
+                "no channels configured — add at least one channel row "
+                "(id like 101, name like 'Driveway')"
+            )
+    else:
+        # Reolink-only install: no DVR backend is created and `channels` is ignored.
+        username = password = ""
+        channels = ()
 
     time_mode = str(raw.get("dvr_time_mode", "auto"))
     if time_mode not in VALID_TIME_MODES:
@@ -89,6 +153,8 @@ def load_config(raw: dict) -> Config:
         max_stage_mb=int(raw.get("max_stage_mb", 256)),
         client_remux_max_mb=int(raw.get("client_remux_max_mb", 128)),
         log_level=str(raw.get("log_level", "info")),
+        max_search_results=int(raw.get("max_search_results", 500)),
+        reolink_cameras=reolink,
     )
 
 

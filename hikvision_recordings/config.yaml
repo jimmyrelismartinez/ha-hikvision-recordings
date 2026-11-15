@@ -1,7 +1,7 @@
 name: DVR Recordings
-version: "0.1.7"
+version: "0.2.0"
 slug: hikvision_recordings
-description: Browse, play and download existing recordings from a Hikvision DVR/NVR
+description: Browse, play and download existing recordings from a Hikvision DVR/NVR and Reolink cameras
 url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings
 arch:
   - aarch64
@@ -33,12 +33,18 @@ options:
   max_concurrent_downloads: 2
   max_stage_mb: 256
   client_remux_max_mb: 128
+  max_search_results: 500
+  # Standalone Reolink cameras recording to their own SD card (HTTP API, not ISAPI).
+  # One row each: name, host, username, password; optional port (80), use_https,
+  # verify_ssl, channel (0). Leave empty if you only have the DVR.
+  reolink_cameras: []
   log_level: info
 schema:
-  dvr_host: str
+  # dvr_* may be left blank when at least one Reolink camera is configured.
+  dvr_host: str?
   dvr_port: port
-  dvr_username: str
-  dvr_password: password
+  dvr_username: str?
+  dvr_password: password?
   dvr_use_https: bool
   dvr_time_mode: list(auto|utc|local|declared)
   channels:
@@ -48,4 +54,14 @@ schema:
   max_concurrent_downloads: int(1,4)
   max_stage_mb: int(16,1024)
   client_remux_max_mb: int(16,512)
+  max_search_results: int(40,2000)
+  reolink_cameras:
+    - name: str
+      host: str
+      username: str
+      password: password
+      port: port?
+      use_https: bool?
+      verify_ssl: bool?
+      channel: int?
   log_level: list(trace|debug|info|warning|error|critical)

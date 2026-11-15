@@ -1,8 +1,10 @@
 # Hikvision Recordings — Home Assistant Add-on
 
-Browse, play and download recordings **already stored on your Hikvision DVR/NVR**.
-This add-on records nothing and stores no video — it reads the DVR's own recording
-index over ISAPI and streams existing clips straight through to your browser.
+Browse, play and download recordings **already stored on your Hikvision DVR/NVR and
+on standalone Reolink cameras' SD cards** (v0.2.0+). This add-on records nothing and
+stores no video — it reads each device's own recording index (ISAPI for the DVR, the
+Reolink HTTP API for Reolink cameras) and streams existing clips straight through to
+your browser.
 
 ## Install
 
@@ -12,6 +14,8 @@ index over ISAPI and streams existing clips straight through to your browser.
    - `dvr_host` — DVR IP (e.g. `10.10.11.56`). Must match the IP/hostname the DVR reports in its own playback URIs. For Hikvision, this is typically the DVR's IP address, not a hostname.
    - `dvr_username` / `dvr_password` — a DVR account with playback rights
    - `channels` — one row per camera: `id` (e.g. `101`) and `name` (e.g. `Driveway`)
+   - `reolink_cameras` — optional, one row per standalone Reolink camera (see below).
+     The `dvr_*` fields may be left blank if you only have Reolink cameras.
 4. Start. The panel appears in the sidebar as **Recordings**.
 
 > Add-on options are stored by Supervisor in `/data/options.json` in plaintext — standard
@@ -19,13 +23,67 @@ index over ISAPI and streams existing clips straight through to your browser.
 
 ## Notes
 
+### Reolink cameras (v0.2.0)
+
+Standalone Reolink cameras that record to their **own SD card** are supported next to
+the DVR. Add one row per camera:
+
+```yaml
+reolink_cameras:
+  - name: Porch
+    host: 192.0.2.40
+    username: viewer        # a non-admin account is enough
+    password: "..."
+    # optional: port (80), use_https (false), verify_ssl (false), channel (0)
+```
+
+Every camera now has a string key — `dvr-101`, `dvr-301`, `reolink-0` — and the search
+can cover one camera, several, or `all` of them in one merged, newest-first list. If one
+device is down the others still answer; the response lists the failure per camera
+instead of failing the whole search.
+
+**Verified live 2026-11-14** against a Reolink **E1 Pro (E Series E330)**, firmware
+`v3.1.0.4417_2412122130`, with `scripts/verify_reolink_contract.py`:
+
+| Fact | Consequence |
+|---|---|
+| Recordings are **MP4, H.264 High + AAC, `moov` at the front**; download honours single byte ranges (206, 416 past the end) | Played **directly**: the add-on proxies the bytes with Range passthrough. No remux on either side, no staging, seekable. Badge: *Direct · native MP4*. |
+| ⚠️ A `Search` window that **crosses midnight returns zero files** (the same range split per day returned 37 + 75) | Every search is split per camera-local calendar day. |
+| Two `Search` commands batched in one request fail (`code 1`) | One request per stream per day. |
+| Main and sub are listed as separate files (`RecM0A_…` / `RecS0A_…`), a second or so apart | Paired by overlap, like the DVR's substream. SD = sub (896×512, ~1 Mbps), HD = main (2880×1616, ~5 Mbps). |
+| Times are camera-local wall clock; files recorded under DST carry `DST` in the name (`RecM0A_DST20261101_…`) | Offset measured against the camera's clock (as for the DVR), plus a per-file DST correction — a clip from before the DST change lands at the right UTC time. |
+| Zero-length stub files exist (`start == end`, 8-byte `mdat`) | Dropped from results. |
+| Bad token → 401 HTML, missing file → 404 HTML | Mapped to re-login-once / "no longer on the camera" (410); never relayed as video. |
+| Login sessions are limited and a token lives an hour | One token is reused and logged out on shutdown; a rejected password backs off for 5 minutes instead of risking an account lockout. |
+
+A Wi-Fi camera is slow to read from: measured through the add-on, an SD stream starts in
+~1.3 s, while the first 8 MB of an HD clip took ~8 s. That is why SD is the default.
+Each open-ended Range (`bytes=N-`) is answered with **at most 8 MiB** — explicit ranges
+are forwarded exactly, as iOS expects — and a playback stream whose reader stops for
+15 s releases its connection slot, so a paused video cannot hold one of the camera's few
+connections hostage. Downloads are exempt from that timeout.
+
+Not supported: Reolink NVR / Home Hub (they need a different download command),
+battery-only models without a local HTTP API, other brands.
+
 ### Search defaults and result order (v0.1.7)
 
 The search page opens with **Last hour** pre-selected instead of Today — the common
 case (checking who just showed up) needs zero taps now. Results also come back
-**newest first**. Note this only reorders what the DVR already returned in one page —
-it does not change which clips were selected before the `max_results` cutoff
-(`truncated: true`); a full fix for that would need DVR-side paging.
+**newest first**.
+
+**Paging (v0.2.0).** Verified live 2026-11-14: this DVR **ignores
+`searchResultPosition`** (positions 0..140 all return the same first page and always say
+`MORE`) and returns **at most 64 items per search** whatever `maxResults` asks for — so
+before v0.2.0 a busy window was silently cut off, and `truncated` could not even fire
+with `max_results` above 64. The add-on now pages by **time cursor**: the next search
+starts at the last returned clip's start time, overlaps are deduplicated, and a short
+page ends the walk (24 h on channel 101: 50 + 29 → 78 clips). `max_results` is the page
+size (capped at 50); `max_search_results` (default 500) caps the total per camera, and
+`truncated` now means that cap — or a run of clips sharing one start time — was hit.
+Because the cursor walks forward in time, a truncated DVR result keeps the **oldest**
+clips of the window — narrow the range to see the latest. (Reolink cameras return a
+whole day at once, so a truncated Reolink result keeps the newest.)
 
 ### Two playback paths: browser remux first, server remux as the fallback
 
@@ -135,8 +193,15 @@ Both `/api/stream` and `/api/stream-raw` accept `?quality=sd|hd`, so either play
 path can serve either quality. Picking HD skips the substream lookup entirely rather
 than searching for a result it would discard.
 
-**`/api/download` is not quality-aware** — it always gives you the full mainstream,
-whatever you picked for playback.
+**`/api/download` is quality-aware since v0.2.0** (`?quality=sd|hd`), and the player's
+Download button follows the SD/HD toggle. It **defaults to `hd`**, so anything that
+doesn't ask still gets the full mainstream, as before.
+
+**Substreams are paired once, at list time (v0.2.0).** The list search also searches
+track `channel+1` for the same (padded) window and pairs each clip with its best
+overlapping substream. SD playback, SD download and thumbnails then need no extra DVR
+search; if the pairing search fails, SD falls back to the old per-play lookup, then to
+the mainstream.
 
 If you choose SD on a channel that has no substream recorded for that window, playback
 **falls back to the mainstream and logs it**, exactly as before — asking for SD is a
@@ -154,9 +219,9 @@ plays the substream** (track `channel+1`, e.g. 102 for channel 101), which this 
 records independently at 960x480 CBR 3072k alongside the 1920x1080 CBR 6144k
 mainstream.
 
-**`/api/download` always fetches the mainstream** — full quality, unchanged. The
-recordings list and thumbnails also stay on the mainstream, so what you see in the
-list describes what Download will give you.
+**`/api/download` fetched only the mainstream until v0.2.0**; it now follows the
+quality you ask for (default HD). Thumbnails moved to the substream at the same time —
+see *Thumbnails*.
 
 Measured live on this DVR, same 36 s clip, end to end through the add-on
 (DVR fetch + remux + staging):
@@ -251,9 +316,13 @@ wall clock for three concurrent requests (the third queues behind
 `max_concurrent_downloads: 2`). That is close to the ~0.4–0.6 s of the original
 frame-0 version, for a meaningfully better frame.
 
-> If the list ever does feel sluggish, the next lever is pointing thumbnails at the
-> substream — about half the bytes. They deliberately use the mainstream today so the
-> preview matches what Download gives you.
+> **v0.2.0: thumbnails read the substream** when one was paired at list time — about
+> half the bytes on the DVR, a fifth on a Reolink — so the same 2 MB read reaches
+> further into the clip and frees the device slot sooner. The old reason for the
+> mainstream ("the preview matches what Download gives you") went away when Download
+> became quality-aware. Note the DVR's substream is 960x480 (2:1), so DVR previews are
+> 480x240 rather than 16:9. Reolink previews decode a 2 MB Range read of the MP4 —
+> verified to work through the same pipe as the DVR's MPEG-PS.
 
 ### Playback is staged; download is streamed
 
@@ -335,6 +404,13 @@ equal to UTC, measures ~0, and gets no shift.
 `/api/health` reports `clock_offset_s` (what is applied) and `clock_drift_s` (how far the
 device's clock sits from a whole-hour zone — a device-clock health signal).
 
-**Still unverified** (deferred, needs a dedicated run of `scripts/verify_dvr_contract.py`):
-thumbnails in `searchMatchItem`, HTTP `Range` support on download, and the search paging
-field name.
+**Paging: verified 2026-11-14** (`verify_dvr_contract.py --page-size 10`, Q5) —
+`searchResultPosition` is ignored, 64 items per search at most; see *Paging* above.
+
+**DST caveat (pre-existing):** the DVR is converted with one measured offset, so on the
+day of a DST change part of that day's clips show an hour off. Reolink cameras are not
+affected (per-file DST marker).
+
+**Range on ISAPI download: not honoured** — the probe's `Range: bytes=0-1023` got HTTP
+200 with the whole clip, which is why the DVR path stages or remuxes instead.
+**Still unverified:** thumbnails in `searchMatchItem`.

@@ -99,3 +99,46 @@ def test_password_is_not_in_repr():
     cfg = load_config(VALID)
     assert "s3cret" not in repr(cfg)
     assert cfg.dvr_password == "s3cret"  # still readable by the code that needs it
+
+
+# ── v0.2.0: Reolink cameras, optional DVR ────────────────────────────────────
+
+REOLINK = {"name": "Porch", "host": "192.0.2.40", "username": "viewer", "password": "pw"}
+
+
+def test_existing_options_without_reolink_still_load():
+    cfg = load_config(VALID)
+    assert cfg.reolink_cameras == ()
+    assert cfg.dvr_configured
+    assert cfg.max_search_results == 500
+
+
+def test_reolink_rows_get_defaults():
+    cfg = load_config({**VALID, "reolink_cameras": [REOLINK]})
+    cam = cfg.reolink_cameras[0]
+    assert (cam.port, cam.use_https, cam.verify_ssl, cam.channel) == (80, False, False, 0)
+    assert cam.base_url == "http://192.0.2.40:80"
+    assert "pw" not in repr(cam), "password must not appear in repr/logs"
+
+
+def test_reolink_only_install_is_allowed():
+    cfg = load_config({"dvr_host": "", "channels": [], "reolink_cameras": [REOLINK]})
+    assert not cfg.dvr_configured
+    assert cfg.channels == ()
+
+
+def test_blank_dvr_without_reolink_still_fails():
+    with pytest.raises(ConfigError, match="dvr_host"):
+        load_config({**VALID, "dvr_host": ""})
+
+
+@pytest.mark.parametrize("missing", ["name", "host", "username", "password"])
+def test_reolink_row_requires_its_fields(missing):
+    row = {**REOLINK, missing: ""}
+    with pytest.raises(ConfigError, match=f"reolink_cameras\\[0\\].{missing}"):
+        load_config({**VALID, "reolink_cameras": [row]})
+
+
+def test_configured_dvr_still_requires_credentials_with_reolink_present():
+    with pytest.raises(ConfigError, match="dvr_password"):
+        load_config({**VALID, "dvr_password": "", "reolink_cameras": [REOLINK]})
