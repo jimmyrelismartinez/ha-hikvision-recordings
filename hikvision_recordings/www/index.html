@@ -9,65 +9,110 @@
   <title>DVR Recordings</title>
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="view-home">
   <header>
     <h1>Recordings</h1>
+    <nav class="tabs" aria-label="Views">
+      <a href="#/" id="tab-cameras" class="tab" aria-current="page">Cameras</a>
+      <a href="#/all" id="tab-all" class="tab">All recordings</a>
+    </nav>
     <span id="status" class="status"></span>
   </header>
 
-  <form id="search-form" class="controls">
-    <div class="field-wide">
-      <span class="field-label" id="cameras-label">Cameras</span>
-      <div id="camera-chips" class="chips" role="group" aria-labelledby="cameras-label"></div>
+  <!-- Home: recent strip + camera tiles. Layout switched via body.view-* -->
+  <section id="view-home" class="view" aria-label="Cameras">
+    <div class="recent-head">
+      <h2>Recent</h2>
+      <a href="#/all" class="see-all">See all</a>
     </div>
-    <label>Date
-      <input type="date" id="date" required>
-    </label>
-    <label>From
-      <input type="time" id="from" value="00:00" step="60" required>
-    </label>
-    <label>To
-      <input type="time" id="to" value="23:59" step="60" required>
-    </label>
-    <div class="presets">
-      <button type="button" data-preset="1h">Last hour</button>
-      <button type="button" data-preset="6h">Last 6 h</button>
-      <button type="button" data-preset="today">Today</button>
-      <button type="button" data-preset="yesterday">Yesterday</button>
+    <div id="recent-strip" class="recent-strip" role="list"></div>
+    <p id="recent-empty" class="message" hidden>No recordings in the last 6 hours</p>
+    <h2 class="section-title">Cameras</h2>
+    <div id="camera-tiles" class="camera-tiles"></div>
+  </section>
+
+  <!-- Camera page: stage is the shared #player-panel (never re-parented). -->
+  <section id="view-camera" class="view" hidden aria-label="Camera">
+    <div class="camera-toolbar">
+      <a href="#/" id="camera-back" class="back-link">← Cameras</a>
+      <h2 id="camera-title" class="camera-title"></h2>
+      <button type="button" id="live-button" class="live-button" hidden>● Live</button>
     </div>
-    <button type="submit" class="primary" id="search-button">Search</button>
-  </form>
-
-  <main class="layout">
-    <!-- One player for the whole page. Sticky at the top on a phone, a side panel
-         on a wide screen. Rows and timeline segments open clips into it. -->
-    <section id="player-panel" class="player-panel" hidden aria-label="Player">
-      <div class="player-head">
-        <div class="player-title">
-          <span id="player-camera" class="player-camera"></span>
-          <span id="player-time" class="player-time"></span>
-        </div>
-        <button type="button" id="player-close" class="icon-button" aria-label="Close player" title="Close">✕</button>
+    <div id="stage-slot" class="stage-slot" aria-hidden="true"></div>
+    <div class="camera-chrome">
+      <div class="timeline-sticky">
+        <button type="button" id="date-chip" class="date-chip" title="Jump to date">Today</button>
+        <input type="date" id="date-jump" class="date-jump" aria-label="Jump to date">
+        <div id="event-filters" class="event-filters" hidden role="group" aria-label="Event type"></div>
+        <button type="button" id="refresh-today" class="icon-button" title="Refresh today" aria-label="Refresh today">↻</button>
       </div>
-      <div id="player-body" class="player-body"></div>
-      <div class="player-nav">
-        <button type="button" id="prev-clip" class="nav-button" title="Earlier clip (j)">◀ Earlier</button>
-        <label class="toggle" title="When a clip ends, play the next later one">
-          <input type="checkbox" id="autoplay"> Autoplay
-        </label>
-        <button type="button" id="next-clip" class="nav-button" title="Later clip (k)">Later ▶</button>
-      </div>
-      <p class="keys-hint">Space play/pause · ←/→ 5 s · j/k earlier/later · f fullscreen</p>
-    </section>
+      <div id="vtimeline" class="vtimeline"></div>
+      <div id="day-sentinel" class="day-sentinel" hidden></div>
+      <p id="camera-end" class="message" hidden></p>
+      <button type="button" id="load-earlier" class="show-more" hidden>Load earlier day</button>
+    </div>
+  </section>
 
-    <section class="browse">
-      <div id="banners" class="banners"></div>
-      <p id="message" class="message" hidden></p>
-      <div id="timeline" class="timeline" hidden></div>
-      <ul id="results" class="results"></ul>
-      <button type="button" id="show-more" class="show-more" hidden>Show more</button>
-    </section>
-  </main>
+  <!-- v0.3.0 search page — behaviour unchanged on #/all -->
+  <section id="view-all" class="view" hidden aria-label="All recordings">
+    <form id="search-form" class="controls">
+      <div class="field-wide">
+        <span class="field-label" id="cameras-label">Cameras</span>
+        <div id="camera-chips" class="chips" role="group" aria-labelledby="cameras-label"></div>
+      </div>
+      <label>Date
+        <input type="date" id="date" required>
+      </label>
+      <label>From
+        <input type="time" id="from" value="00:00" step="60" required>
+      </label>
+      <label>To
+        <input type="time" id="to" value="23:59" step="60" required>
+      </label>
+      <div class="presets">
+        <button type="button" data-preset="1h">Last hour</button>
+        <button type="button" data-preset="6h">Last 6 h</button>
+        <button type="button" data-preset="today">Today</button>
+        <button type="button" data-preset="yesterday">Yesterday</button>
+      </div>
+      <button type="submit" class="primary" id="search-button">Search</button>
+    </form>
+
+    <div class="layout">
+      <div class="browse">
+        <div id="banners" class="banners"></div>
+        <p id="message" class="message" hidden></p>
+        <div id="timeline" class="timeline" hidden></div>
+        <ul id="results" class="results"></ul>
+        <button type="button" id="show-more" class="show-more" hidden>Show more</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ONE player for the whole app. Never re-parented; body.view-* switches layout. -->
+  <section id="player-panel" class="player-panel" hidden aria-label="Player">
+    <div class="player-head">
+      <div class="player-title">
+        <span id="player-camera" class="player-camera"></span>
+        <span id="player-time" class="player-time"></span>
+      </div>
+      <button type="button" id="player-close" class="icon-button" aria-label="Close player" title="Close">✕</button>
+    </div>
+    <div id="stage-live" class="stage-live" hidden>
+      <img id="stage-image" class="stage-image" alt="">
+      <p id="stage-label" class="stage-label">Live · snapshot</p>
+      <p id="stage-paused" class="stage-paused" hidden>Paused · tap to resume</p>
+    </div>
+    <div id="player-body" class="player-body"></div>
+    <div class="player-nav">
+      <button type="button" id="prev-clip" class="nav-button" title="Earlier clip (j)">◀ Earlier</button>
+      <label class="toggle" title="When a clip ends, play the next later one">
+        <input type="checkbox" id="autoplay"> Autoplay
+      </label>
+      <button type="button" id="next-clip" class="nav-button" title="Later clip (k)">Later ▶</button>
+    </div>
+    <p class="keys-hint">Space play/pause · ←/→ 5 s · j/k earlier/later · f fullscreen</p>
+  </section>
 
   <!-- ffmpeg.wasm, vendored into the image at build time (see Dockerfile) — never
        a CDN, so playback never needs outbound internet from the container.
