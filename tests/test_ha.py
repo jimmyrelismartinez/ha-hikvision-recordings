@@ -204,3 +204,29 @@ async def test_token_never_in_error_message():
         await ha.snapshot("camera.porch")
     await ha.aclose()
     assert TOKEN not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_first_caller_cancelled_does_not_start_a_second_fetch():
+    """A disconnecting first caller must not clear the shared in-flight fetch."""
+    calls = 0
+    release = asyncio.Event()
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return httpx.Response(200, content=b"\xff\xd8jpeg", headers={"content-type": "image/jpeg"})
+
+    ha = HaClient(TOKEN, transport=httpx.MockTransport(handler), base_url="http://supervisor/core/api")
+    first = asyncio.create_task(ha.snapshot("camera.porch"))
+    await asyncio.sleep(0.01)
+    first.cancel()
+    await asyncio.sleep(0.01)
+    second = asyncio.create_task(ha.snapshot("camera.porch"))
+    await asyncio.sleep(0.01)
+    release.set()
+    body, _ = await second
+    await ha.aclose()
+    assert body == b"\xff\xd8jpeg"
+    assert calls == 1

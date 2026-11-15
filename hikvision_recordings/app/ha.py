@@ -111,11 +111,10 @@ class HaClient:
             self._fetch_and_cache(entity_id), name=f"ha-snap-{entity_id}"
         )
         self._inflight[entity_id] = task
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if self._inflight.get(entity_id) is task:
-                self._inflight.pop(entity_id, None)
+        # The task clears its own slot when it finishes — not the first caller,
+        # who may disconnect while the shared fetch is still running.
+        task.add_done_callback(lambda t, e=entity_id: _finish(self._inflight, e, t))
+        return await asyncio.shield(task)
 
     async def _fetch_and_cache(self, entity_id: str) -> tuple[bytes, str]:
         try:
@@ -185,6 +184,13 @@ class HaClient:
             raise HaUnreachable(
                 "Home Assistant did not return a snapshot."
             ) from exc
+
+
+def _finish(inflight: dict, key, task: asyncio.Task) -> None:
+    if inflight.get(key) is task:
+        inflight.pop(key, None)
+    if not task.cancelled():
+        task.exception()    # mark retrieved even if every waiter left
 
 
 def is_valid_ha_camera(value: str) -> bool:
