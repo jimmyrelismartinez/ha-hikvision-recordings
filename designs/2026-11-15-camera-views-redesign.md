@@ -293,3 +293,124 @@ PR B (frontend, v0.5.0): `www/index.html`, `www/app.js` (+ optional new plain sc
 
 List HA `camera.*` entities (`/api/states`) and offer them for `ha_camera`; pre-fill host
 and name from the device registry where HA has them. Credentials stay user-entered.
+
+## 10. Resolutions after goldfish review (2026-11-15)
+
+The review was checked against the code; every cited line held. **These resolutions
+override §3–§7 wherever they differ.** Decisions taken by the design owner (Claude, per the
+owner's delegation); owner confirmed the scope earlier (redesign now, discovery later) and
+accepted `homeassistant_api`.
+
+### 10.1 Blocker — clip ids under infinite scroll (PR A)
+
+`ClipRegistry.put` mints a fresh id per search and FIFO-evicts; a long scroll would 410
+Today's clips. Fix in `registry.py`: keep a secondary index
+`(kind, camera_key, start, main_ref) → clip_id`. `put` for an already-known clip **returns
+the existing id**, refreshes its TTL, moves it to the MRU end, and updates its `Clip`
+(e.g. a newly paired sub). Raise default capacity to `max(2000, …)`. Tests: same clip
+twice → same id; TTL refreshed; eviction removes the index entry too.
+PR B: on HTTP 410 from stream/thumbnail/download, re-fetch that clip's day and retry once
+by `clipKey`; a second 410 shows "This clip is no longer available — refresh".
+
+### 10.2 Security (PR A)
+
+- **Token isolation.** At startup read `SUPERVISOR_TOKEN` once, then `os.environ.pop` it.
+  Every subprocess (`thumbnail.py`, `remux.py`) gets an explicit minimal
+  `env={"PATH": …, "LANG": "C.UTF-8"}` — ffmpeg parses untrusted device bytes and must not
+  inherit the token. Test: the env passed to `create_subprocess_exec` has no
+  `SUPERVISOR_TOKEN`.
+- `HaClient` has its own `httpx.AsyncClient(follow_redirects=False, trust_env=False)`.
+- Entity id: `re.fullmatch(r"camera\.[a-z0-9_]{1,64}", value)`; test `"camera.x\n"`,
+  `"camera.x/../states"`, `"light.x"`, uppercase → rejected. Schema:
+  `ha_camera: "match(^camera\\.[a-z0-9_]{1,64}$)?"` on both lists.
+- Snapshot responses: only `image/jpeg` or `image/png` pass; anything else → 502.
+  Always send `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+- **Ingress-only listener**: a middleware that, when running under Supervisor (token
+  was present), rejects requests whose peer is not `172.30.32.2` (the Supervisor ingress
+  proxy) or `127.0.0.1` with 403. Off when no token (local dev/tests). Test both modes.
+
+### 10.3 Snapshot load (PR A + B)
+
+- Server: single-flight per entity runs in a **shielded task** (one client disconnecting
+  does not cancel the shared fetch). **Failures are cached for the TTL** too. TTL 2 s.
+- Client: never a fixed interval — schedule the next fetch only after the previous image
+  loaded or failed. Camera page: every **5 s** (not 3 s). Home tiles: every 60 s. Both stop
+  when the view/tab is hidden **and** after **2 min without interaction**, showing
+  "Paused · tap to resume". Final cadence is revisited after Q1.
+
+### 10.4 Thumbnails (PR A + B)
+
+- Server: the LRU (§3.5) also single-flights per key, so two viewers of the same row cost
+  one device read.
+- Client: reuse the existing `thumbObserver` (app.js), at most **2 thumbnail requests in
+  flight** app-wide, queued newest-visible first; a row that leaves the viewport before
+  its request starts is dropped from the queue. No `loading="lazy"` reliance.
+
+### 10.5 Timeline simplified (PR B) — replaces the geometry in §4.3
+
+Cut for v0.5.0: proportional row heights, hour ticks, tap-to-seek (the native scrubber
+seeks). Keep the Scrypted look with simple geometry:
+- Each clip is a fixed-height row (the card height): time label left, a bar segment in the
+  middle column (the bar is continuous through the rows of a run of clips), card right.
+- Between clips with a gap ≥ 2 min: a 28 px band with no bar, labelled "2 h 13 m".
+- Newest at the top; a "now" line at the top of Today.
+
+### 10.6 Day loading (PR B)
+
+- **Dedupe by `clipKey`** across days (a clip spanning midnight comes back for both
+  days); it is shown in the day of its start.
+- A failed day shows a retry row and **pauses** auto-loading until the retry succeeds.
+- Auto-load (sentinel) only while the last loaded day added at least one *visible* card or
+  is empty; when a filter hides everything, show a "Load earlier day" button instead.
+- Stop rule unchanged: 7 consecutive empty days or 30 days back → "No older recordings".
+- `truncated` for a day → inline notice "Not every clip of this day could be listed".
+
+### 10.7 Recent strip and routes (PR B)
+
+- Times sent to the API are ISO-8601 UTC (`toISOString()`), never relative strings.
+- Recent is fetched on entering `#/` only if the last fetch is older than 60 s.
+- Tapping a Recent card calls `openClip` **synchronously in the tap handler** (iOS
+  gesture), then sets `#/camera/<key>?t=<start ISO>`; the camera page loads the day
+  containing `t`, reconciles the playing clip by `clipKey`, and scrolls to it. The route
+  `?t=` with no playing clip just loads that day and scrolls to it.
+- Leaving a route disposes the playing clip (generation bump, abort). `#player-panel` is
+  never re-parented; views are siblings and layout is switched with a class on `<body>`.
+- Health dot mapping: a camera key `dvr-*` maps to device prefix `dvr`; a Reolink key maps
+  to its own prefix (`devices[].prefix` equals the camera key).
+
+### 10.8 Event labels (PR A)
+
+- Reolink: decode **only** basenames with 7 `_` fields, version (hex, chars 4–5 of the
+  first field) `09` or `0A`, flags = **6th field, 14 hex digits**; everything else `()`.
+  "Bit n" is counted after reversing the bit string of the whole word (so bit 0 is the
+  word's least significant bit's mirror — follow `decode_hex_to_flags` exactly).
+  Test vectors (from the live probe):
+
+  | flags word | events |
+  |---|---|
+  | `9B288080000000` | `motion` |
+  | `9B28C080000000` | `motion, person` |
+  | `9B28C000000000` | `person` |
+  | `9B28C880000000` | `motion, person, animal` |
+  | `9B288800000000` | `animal` |
+  | `9B28C800000000` | `person, animal` |
+  | `9B288880000000` | `motion, animal` |
+
+  (Output order follows §3.4: motion, person, vehicle, animal, face, doorbell, scheduled,
+  alarm.)
+- `Recording.events` defaults to `()`; `_as_recording` keeps working unchanged.
+- Filters (PR B): chips for every vocabulary type that occurs in the loaded days; hidden
+  when ≤ 1 type occurs. Earlier/Later/Autoplay **skip** filtered-out clips. A persisted
+  filter whose type is absent falls back to All.
+
+### 10.9 Static files (PR B)
+
+Any new script file must be added to the version-stamped list in `main.py` `index()` and to
+`tests/test_static_cache.py` (stale WKWebView cache, see `main.py`).
+
+### 10.10 Release
+
+PR A (v0.4.0) is merged first and **is the Q1 probe**: the owner sets `ha_camera` on one
+camera, updates the add-on, and opens `api/snapshot/<key>` through the add-on. No HA token
+leaves HA. PR B is built on top meanwhile and its snapshot cadence is adjusted if the probe
+shows slow (ffmpeg-backed) snapshots.
