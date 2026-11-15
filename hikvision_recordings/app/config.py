@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 DEFAULT_OPTIONS_PATH = "/data/options.json"
@@ -18,6 +19,9 @@ DEFAULT_OPTIONS_PATH = "/data/options.json"
 #              wrong under DST on this hardware — kept only as an escape hatch)
 VALID_TIME_MODES = ("auto", "utc", "local", "declared")
 
+# HA entity id pasted into a URL that carries the Supervisor token — keep tight.
+HA_CAMERA_RE = re.compile(r"camera\.[a-z0-9_]{1,64}")
+
 
 class ConfigError(ValueError):
     """Add-on options are missing or invalid. The add-on refuses to start."""
@@ -27,6 +31,7 @@ class ConfigError(ValueError):
 class Channel:
     id: int
     name: str
+    ha_camera: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,7 @@ class ReolinkCamera:
     use_https: bool = False
     verify_ssl: bool = False
     channel: int = 0
+    ha_camera: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -85,6 +91,26 @@ def _required(raw: dict, key: str) -> str:
     return value
 
 
+def _ha_camera(row: dict, where: str) -> str | None:
+    """Optional HA entity id. Empty/whitespace == absent. Reject anything not camera.*.
+
+    Validated with fullmatch on the exact string (no strip), so values like
+    `camera.x\\n` or `camera.x/../states` cannot sneak through whitespace trimming.
+    """
+    raw = row.get("ha_camera", None)
+    if raw is None:
+        return None
+    value = str(raw)
+    if not value.strip():
+        return None
+    if not HA_CAMERA_RE.fullmatch(value):
+        raise ConfigError(
+            f"{where}.ha_camera must be a camera entity id "
+            f"(camera.name_with_underscores), got {value!r}"
+        )
+    return value
+
+
 def _reolink_cameras(raw: dict) -> tuple[ReolinkCamera, ...]:
     cameras = []
     for index, row in enumerate(raw.get("reolink_cameras") or []):
@@ -107,6 +133,7 @@ def _reolink_cameras(raw: dict) -> tuple[ReolinkCamera, ...]:
                 use_https=bool(row.get("use_https", False)),
                 verify_ssl=bool(row.get("verify_ssl", False)),
                 channel=int(row.get("channel") or 0),
+                ha_camera=_ha_camera(row, where),
             )
         )
     return tuple(cameras)
@@ -122,10 +149,17 @@ def load_config(raw: dict) -> Config:
         host = _required(raw, "dvr_host")
         username = _required(raw, "dvr_username")
         password = _required(raw, "dvr_password")
-        channels = tuple(
-            Channel(id=int(c["id"]), name=str(c["name"]).strip())
-            for c in (raw.get("channels") or [])
-        )
+        channels = []
+        for index, c in enumerate(raw.get("channels") or []):
+            where = f"channels[{index}]"
+            channels.append(
+                Channel(
+                    id=int(c["id"]),
+                    name=str(c["name"]).strip(),
+                    ha_camera=_ha_camera(c, where),
+                )
+            )
+        channels = tuple(channels)
         if not channels:
             raise ConfigError(
                 "no channels configured — add at least one channel row "
