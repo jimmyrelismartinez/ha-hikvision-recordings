@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -73,8 +74,10 @@ def test_channels_come_from_options():
     with client_for(FakeClient()) as client:
         body = client.get("/api/channels").json()
     assert body == [
-        {"id": "dvr-101", "key": "dvr-101", "name": "DriveWay1", "kind": "dvr"},
-        {"id": "dvr-401", "key": "dvr-401", "name": "ENTRYWAY", "kind": "dvr"},
+        {"id": "dvr-101", "key": "dvr-101", "name": "DriveWay1", "kind": "dvr",
+         "snapshot": False},
+        {"id": "dvr-401", "key": "dvr-401", "name": "ENTRYWAY", "kind": "dvr",
+         "snapshot": False},
     ]
 
 
@@ -209,3 +212,104 @@ def test_index_is_served_at_root():
         response = client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
+
+
+# ── v0.4.0: snapshots, events, ingress middleware, ha_api ─────────────────────
+
+def test_health_reports_ha_api_off_without_token():
+    with client_for(FakeClient()) as client:
+        body = client.get("/api/health").json()
+    assert body["ha_api"] == "off"
+    assert body["version"] == "0.4.0"
+
+
+def test_recordings_include_events_list():
+    with client_for(FakeClient()) as client:
+        clip = client.get(
+            "/api/recordings",
+            params={"channel": 101, "start": "2026-07-24T18:00:00Z",
+                    "end": "2026-07-24T19:00:00Z"},
+        ).json()["clips"][0]
+    assert clip["events"] == []
+
+
+def test_snapshot_404_unknown_camera():
+    with client_for(FakeClient()) as client:
+        assert client.get("/api/snapshot/dvr-999").status_code == 404
+
+
+def test_snapshot_404_when_not_linked():
+    with client_for(FakeClient()) as client:
+        response = client.get("/api/snapshot/dvr-101")
+    assert response.status_code == 404
+    assert "Not linked" in response.json()["detail"]
+
+
+def test_snapshot_503_when_ha_disabled_but_linked():
+    options = {
+        **OPTIONS,
+        "channels": [{"id": 101, "name": "Porch", "ha_camera": "camera.porch"}],
+    }
+    app = create_app(load_config(options), client=FakeClient())
+    with TestClient(app) as client:
+        response = client.get("/api/snapshot/dvr-101")
+        channels = client.get("/api/channels").json()
+    assert response.status_code == 503
+    assert "homeassistant_api" in response.json()["detail"]
+    assert channels[0]["snapshot"] is False
+
+
+def test_snapshot_200_with_injected_ha_client():
+    jpeg = b"\xff\xd8\xff\xd9fake"
+
+    class FakeHa:
+        enabled = True
+
+        async def snapshot(self, entity_id: str):
+            assert entity_id == "camera.porch"
+            return jpeg, "image/jpeg"
+
+        async def aclose(self):
+            return None
+
+    options = {
+        **OPTIONS,
+        "channels": [{"id": 101, "name": "Porch", "ha_camera": "camera.porch"}],
+    }
+    app = create_app(load_config(options), client=FakeClient(), ha_client=FakeHa())
+    with TestClient(app) as client:
+        response = client.get("/api/snapshot/dvr-101")
+        channels = client.get("/api/channels").json()
+        health = client.get("/api/health").json()
+    assert response.status_code == 200
+    assert response.content == jpeg
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert channels[0]["snapshot"] is True
+    assert health["ha_api"] == "ok"
+
+
+def test_ingress_middleware_off_without_token():
+    """Local/dev: TestClient peer is not the ingress proxy, but middleware is off."""
+    with client_for(FakeClient()) as client:
+        assert client.get("/api/health").status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_ingress_middleware_on_with_token(monkeypatch):
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "test-token-not-real")
+    app = create_app(load_config(OPTIONS), client=FakeClient())
+    # Foreign peer → 403
+    transport = httpx.ASGITransport(app=app, client=("192.0.2.99", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        forbidden = await client.get("/api/health")
+    assert forbidden.status_code == 403
+    # Ingress peer → allowed
+    transport_ok = httpx.ASGITransport(app=app, client=("172.30.32.2", 12345))
+    async with httpx.AsyncClient(transport=transport_ok, base_url="http://test") as client:
+        ok = await client.get("/api/health")
+    assert ok.status_code == 200
+    assert ok.json()["ha_api"] == "ok"
+    # Token was popped from the environment at create_app.
+    assert "SUPERVISOR_TOKEN" not in __import__("os").environ

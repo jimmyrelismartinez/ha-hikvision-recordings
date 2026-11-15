@@ -145,3 +145,26 @@ async def test_source_error_before_first_byte_propagates_its_own_type():
     with pytest.raises(SourceBoom):
         async for _ in remux_to_fmp4(dying_source()):
             pass
+
+
+async def test_ffmpeg_subprocess_env_has_no_supervisor_token(monkeypatch, mpeg_ps_bytes):
+    """ffmpeg must not inherit SUPERVISOR_TOKEN (design §10.2)."""
+    seen = {}
+    real = asyncio.create_subprocess_exec
+
+    async def wrapper(*args, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "must-not-leak-to-ffmpeg")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", wrapper)
+
+    async def source():
+        for i in range(0, len(mpeg_ps_bytes), 32768):
+            yield mpeg_ps_bytes[i : i + 32768]
+
+    async for _ in remux_to_fmp4(source()):
+        pass
+    assert seen["env"] is not None
+    assert "SUPERVISOR_TOKEN" not in seen["env"]
+    assert "PATH" in seen["env"]

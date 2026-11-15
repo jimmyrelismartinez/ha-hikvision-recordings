@@ -11,6 +11,7 @@ ffmpeg. Two properties matter beyond "it returns an image":
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -287,3 +288,41 @@ async def test_source_is_closed_so_the_semaphore_permit_is_returned(mpeg_ps_byte
     jpeg = await thumbnail_from_stream(source())
     assert jpeg.startswith(b"\xff\xd8\xff")
     assert closed["yes"], "the DVR source generator was never closed"
+
+
+def test_lru_hit_avoids_a_second_device_read(mpeg_ps_bytes):
+    """Same clip listed twice must reuse the in-memory JPEG (design §3.5 / §10.4)."""
+    fake = FakeClient(mpeg_ps_bytes)
+    with _client(fake) as client:
+        clip_id = _clip_id(client)
+        first = client.get(f"/api/thumbnail/{clip_id}")
+        second = client.get(f"/api/thumbnail/{clip_id}")
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.content == second.content
+    assert fake.stream_calls == 1, "cache miss re-read the device"
+
+
+async def test_ffmpeg_subprocess_env_has_no_supervisor_token(monkeypatch, mpeg_ps_bytes):
+    """ffmpeg must not inherit SUPERVISOR_TOKEN (design §10.2)."""
+    seen = {}
+
+    real = asyncio.create_subprocess_exec
+
+    async def wrapper(*args, **kwargs):
+        seen["env"] = kwargs.get("env")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "must-not-leak-to-ffmpeg")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", wrapper)
+
+    async def source():
+        yield mpeg_ps_bytes
+
+    from hikvision_recordings.app import thumbnail as thumb_mod
+    # Re-import would keep the module-level _FFMPEG_ENV frozen at import time,
+    # which is correct: the explicit env must not include SUPERVISOR_TOKEN.
+    jpeg = await thumb_mod.thumbnail_from_stream(source())
+    assert jpeg.startswith(b"\xff\xd8\xff")
+    assert seen["env"] is not None
+    assert "SUPERVISOR_TOKEN" not in seen["env"]
+    assert "PATH" in seen["env"]
