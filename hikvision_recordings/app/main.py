@@ -45,7 +45,7 @@ from .thumbnail import (
     thumbnail_from_stream,
 )
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
