@@ -30,6 +30,8 @@ class Clip:
     main_ref: str            # Hikvision playbackURI / Reolink file name
     sub_ref: str | None = None
     sub_size_bytes: int | None = None
+    # Closed vocabulary (motion/person/…); order is the canonical one in reolink_flags.
+    events: tuple[str, ...] = ()
 
     @property
     def duration_s(self) -> int:

@@ -36,6 +36,7 @@ import httpx
 
 from .clips import KIND_REOLINK, SUB_WINDOW_PAD, Clip, best_overlap
 from .config import ReolinkCamera
+from .reolink_flags import events_from_filename
 from .isapi import (
     BUSY_TIMEOUT_S,
     CLOCK_TTL_S,
@@ -378,6 +379,7 @@ class ReolinkClient:
                 camera_key=self.key, kind=KIND_REOLINK, channel=self.camera.channel,
                 start=start, end=end, size_bytes=size, main_ref=name,
                 sub_ref=sub[0] if sub else None, sub_size_bytes=sub[3] if sub else None,
+                events=events_from_filename(name),
             ))
         clips.sort(key=lambda c: c.start)
         truncated = len(clips) > limit
