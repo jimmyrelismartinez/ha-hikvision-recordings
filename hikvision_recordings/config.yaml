@@ -1,5 +1,5 @@
 name: DVR Recordings
-version: "0.3.0"
+version: "0.4.0"
 slug: hikvision_recordings
 description: Browse, play and download existing recordings from a Hikvision DVR/NVR and Reolink cameras
 url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings
@@ -14,6 +14,8 @@ init: false
 tmpfs: true
 ingress: true
 ingress_port: 8099
+# Lets the add-on call HA's camera_proxy for near-live snapshots (SUPERVISOR_TOKEN).
+homeassistant_api: true
 panel_icon: mdi:cctv
 panel_title: Recordings
 panel_admin: false
@@ -50,6 +52,7 @@ schema:
   channels:
     - id: int
       name: str
+      ha_camera: "match(^camera\\.[a-z0-9_]{1,64}$)?"
   max_results: int(1,200)
   max_concurrent_downloads: int(1,4)
   max_stage_mb: int(16,1024)
@@ -64,4 +67,5 @@ schema:
       use_https: bool?
       verify_ssl: bool?
       channel: int?
+      ha_camera: "match(^camera\\.[a-z0-9_]{1,64}$)?"
   log_level: list(trace|debug|info|warning|error|critical)
