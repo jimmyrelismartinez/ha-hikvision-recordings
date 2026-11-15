@@ -17,6 +17,8 @@
   --now: #cf222e;
   --shadow: 0 1px 3px rgba(31, 35, 40, 0.12);
   --tap: 44px;
+  /* Kept current by ResizeObserver: height of the sticky player panel. */
+  --player-sticky-offset: 0px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -103,7 +105,7 @@ body.view-camera #stage-slot { display: none; }
 }
 
 .timeline-sticky {
-  position: sticky; top: 0; z-index: 4;
+  position: sticky; top: var(--player-sticky-offset); z-index: 4;
   display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
   padding: 0.4rem 0; background: var(--bg);
 }
@@ -476,4 +478,5 @@ body.view-all .player-panel { margin-top: 1rem; }
    so its own controls can never end up below the bottom edge. */
 @media (max-height: 699px) {
   .player-panel { position: static; }
+  .timeline-sticky { top: 0; }
 }
