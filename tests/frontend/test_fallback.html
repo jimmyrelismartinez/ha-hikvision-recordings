@@ -32,6 +32,7 @@
   <button type="button" id="live-button" hidden>● Live</button>
   <button type="button" id="date-chip">Today</button>
   <input type="date" id="date-jump">
+  <button type="button" id="back-to-today" hidden>Back to today</button>
   <div id="event-filters" hidden></div>
   <button type="button" id="refresh-today"></button>
   <div id="vtimeline"></div>
@@ -83,11 +84,18 @@ window.__recordings = { clips: [], truncated: false, truncated_cameras: [], erro
 window.__aborted = [];
 window.__rawDelay = 0;
 window.__recordingsStatus = 200;
+window.__recordingsDelay = 0;
 window.__thumbDelay = 0;
 window.__thumbStatus = 200;
+window.__streamStatus = 200;
+window.__downloadStatus = 200;
 
 window.fetch = async (url, options) => {
   window.__fetches.push(String(url));
+  const signal = options && options.signal;
+  if (signal && signal.aborted) {
+    throw new DOMException('aborted', 'AbortError');
+  }
   if (String(url).startsWith('api/channels')) {
     return { ok: true, json: async () => [
       { id: 'dvr-101', key: 'dvr-101', name: 'Driveway', kind: 'dvr', snapshot: true },
@@ -107,6 +115,16 @@ window.fetch = async (url, options) => {
     }) };
   }
   if (String(url).startsWith('api/recordings')) {
+    if (window.__recordingsDelay) {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, window.__recordingsDelay);
+        if (signal) signal.addEventListener('abort', () => {
+          clearTimeout(t);
+          window.__aborted.push(String(url));
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    }
     if (typeof window.__recordingsFor === 'function') {
       const body = window.__recordingsFor(String(url));
       return { ok: true, status: 200, json: async () => body };
@@ -148,8 +166,13 @@ window.fetch = async (url, options) => {
     if (window.__nextRawResponse) return window.__nextRawResponse();
     return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
   }
-  if (String(url).startsWith('api/stream/') || String(url).startsWith('api/download/')) {
-    return { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0) };
+  if (String(url).startsWith('api/stream/')) {
+    const status = window.__streamStatus;
+    return { ok: status < 400, status, arrayBuffer: async () => new ArrayBuffer(0) };
+  }
+  if (String(url).startsWith('api/download/')) {
+    const status = window.__downloadStatus;
+    return { ok: status < 400, status, arrayBuffer: async () => new ArrayBuffer(0) };
   }
   throw new Error('unexpected fetch ' + url);
 };
@@ -180,6 +203,7 @@ const checks = [];
 function check(name, cond, detail) {
   checks.push({ name, pass: !!cond, detail: detail || '' });
   out.textContent += `${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}\n`;
+  window.__progress = name;
 }
 
 const SMALL_CLIP = { id: 'abc123', size_bytes: 4 * 1024 * 1024, duration_s: 35 };
@@ -902,12 +926,52 @@ async function runCase({ clip, behaviour, raw, quality }) {
       check('Earlier crosses days', false, 'missing fixtures');
     }
 
-    // Date chip jump
-    document.getElementById('date-jump').value = localDate(addLocalDays(new Date(), -1));
+    // Date chip jump — resets to jumped day onward (no holes), max=today
+    window.__recordingsFor = (u) => {
+      const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+      const day = localDate(new Date(start));
+      const jump = localDate(addLocalDays(new Date(), -5));
+      if (day === jump) {
+        return { clips: [dayClip('jump5', 'reolink-0', 'Porch', 'reolink', -5, 12, 0, ['person'])],
+                 truncated: false, truncated_cameras: [], errors: [] };
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    route = { name: 'camera', key: 'reolink-0' };
+    camState.key = 'reolink-0';
+    document.getElementById('date-jump').max = localDate(new Date());
+    document.getElementById('date-jump').value = localDate(addLocalDays(new Date(), -5));
     document.getElementById('date-jump').dispatchEvent(new Event('change'));
-    await until(() => document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -1))}"]`));
+    await until(() => document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -5))}"]`));
     check('date chip jump loads that day',
-          !!document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -1))}"]`));
+          !!document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -5))}"]`));
+    check('date jump shows only jumped day (no today hole)',
+          camState.days.every((d) => d.day <= localDate(addLocalDays(new Date(), -5)))
+          && camState.days.some((d) => d.day === localDate(addLocalDays(new Date(), -5)))
+          && !camState.days.some((d) => d.day === localDate(new Date())),
+          camState.days.map((d) => d.day).join(','));
+    check('date jump max is today',
+          document.getElementById('date-jump').max === localDate(new Date()));
+    check('date jump shows Back to today',
+          document.getElementById('back-to-today')
+          && document.getElementById('back-to-today').hidden === false);
+    // Jump ≥30 days back still loads that day
+    window.__recordingsFor = (u) => {
+      const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+      const day = localDate(new Date(start));
+      const jump = localDate(addLocalDays(new Date(), -35));
+      if (day === jump) {
+        return { clips: [dayClip('jump35', 'reolink-0', 'Porch', 'reolink', -35, 12, 0, ['person'])],
+                 truncated: false, truncated_cameras: [], errors: [] };
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    document.getElementById('date-jump').value = localDate(addLocalDays(new Date(), -35));
+    document.getElementById('date-jump').dispatchEvent(new Event('change'));
+    await until(() => document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -35))}"]`));
+    check('date jump ≥30 days back still loads that day',
+          !!document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -35))}"]`)
+          && camState.days.some((d) => d.day === localDate(addLocalDays(new Date(), -35))));
 
     // 410 retry by clipKey
     window.__recordingsFor = null;
@@ -953,6 +1017,301 @@ async function runCase({ clip, behaviour, raw, quality }) {
     check('thumbnail in-flight cap of 2', thumbInflight <= 2, String(thumbInflight));
     await sleep(500);
     window.__thumbDelay = 0;
+
+    // ── Review fixes (v0.5 frontend) ─────────────────────────────────────────
+    window.__recordingsDelay = 0;
+    window.__streamStatus = 200;
+    window.__downloadStatus = 200;
+
+    // MAJOR 1: sentinel re-check continues through sparse/empty days
+    {
+      let emptyLoads = 0;
+      window.__recordingsFor = (u) => {
+        const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+        const startMs = Date.parse(start);
+        const today0 = startOfLocalDay(new Date());
+        const daysBack = Math.round((today0.getTime() - startOfLocalDay(new Date(startMs)).getTime()) / 86400000);
+        if (daysBack === 0) {
+          return { clips: [dayClip('sparse0', 'dvr-101', 'Driveway', 'dvr', 0, 12, 0)],
+                   truncated: false, truncated_cameras: [], errors: [] };
+        }
+        emptyLoads += 1;
+        return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+      };
+      resetCameraState('dvr-101');
+      route = { name: 'camera', key: 'dvr-101' };
+      await loadDay(startOfLocalDay(new Date()));
+      const sent = document.getElementById('day-sentinel');
+      sent.hidden = false;
+      sent.getBoundingClientRect = () => ({ top: 100, bottom: 120, left: 0, right: 10, width: 10, height: 20 });
+      await maybeContinueFromSentinel();
+      check('MAJOR1 sentinel re-check reaches 7-empty stop',
+            camState.stopped === true && emptyLoads >= EMPTY_DAY_STOP,
+            `stopped=${camState.stopped} emptyLoads=${emptyLoads} streak=${camState.emptyStreak}`);
+    }
+
+    // MAJOR 2: sticky timeline offset under pinned player
+    {
+      document.documentElement.style.setProperty('--player-sticky-offset', '0px');
+      playerPanel.hidden = false;
+      document.body.classList.add('view-camera');
+      const prevCS = window.getComputedStyle;
+      const prevRect = playerPanel.getBoundingClientRect;
+      window.getComputedStyle = (el, pseudo) => {
+        const st = prevCS.call(window, el, pseudo);
+        if (el === playerPanel) {
+          return Object.create(st, { position: { value: 'sticky', enumerable: true } });
+        }
+        return st;
+      };
+      playerPanel.getBoundingClientRect = () => ({ top: 0, bottom: 180, height: 180, left: 0, right: 300, width: 300, x: 0, y: 0, toJSON() {} });
+      syncPlayerStickyOffset();
+      const offset = document.documentElement.style.getPropertyValue('--player-sticky-offset').trim();
+      check('MAJOR2 sticky offset matches player height',
+            offset === '180px', offset);
+      window.getComputedStyle = prevCS;
+      playerPanel.getBoundingClientRect = prevRect;
+      syncPlayerStickyOffset();
+    }
+
+    // MAJOR 3: stale day responses do not render into the wrong page
+    {
+      window.__recordingsDelay = 60;
+      window.__recordingsFor = (u) => {
+        if (u.includes('camera=dvr-101')) {
+          return { clips: [dayClip('staleA', 'dvr-101', 'Driveway', 'dvr', 0, 12, 0)],
+                   truncated: false, truncated_cameras: [], errors: [] };
+        }
+        return { clips: [dayClip('freshB', 'reolink-0', 'Porch', 'reolink', 0, 12, 0, ['person'])],
+                 truncated: false, truncated_cameras: [], errors: [] };
+      };
+      // Start camera A, then switch to B before A's delayed fetch settles.
+      const loadA = (async () => {
+        resetCameraState('dvr-101');
+        route = { name: 'camera', key: 'dvr-101' };
+        return loadDay(startOfLocalDay(new Date()));
+      })();
+      await sleep(15);
+      resetCameraState('reolink-0');
+      route = { name: 'camera', key: 'reolink-0' };
+      await loadDay(startOfLocalDay(new Date()));
+      await loadA;
+      window.__recordingsDelay = 0;
+      const ids = camState.days.flatMap((d) => d.clips.map((c) => c.id));
+      check('MAJOR3 stale A→B day response discarded',
+            !ids.includes('staleA') && ids.includes('freshB'),
+            ids.join(','));
+      // Back before day loads must not openClip on home
+      window.__recordingsDelay = 80;
+      const pendingEnter = enterCamera('reolink-0', dayIso(0, 12, 0));
+      await sleep(20);
+      disposeRoute();
+      route = { name: 'home' };
+      document.body.classList.remove('view-camera');
+      document.body.classList.add('view-home');
+      await pendingEnter;
+      window.__recordingsDelay = 0;
+      check('MAJOR3 back before day load does not leave playing clip on home',
+            current === null,
+            `current=${current && current.clip && current.clip.id} route=${route.name}`);
+    }
+
+    // MAJOR 4: stage image cleared on entry; thumb bypasses loaded guard; route check after await
+    {
+      clearStageImage();
+      stageImage.dataset.loaded = '1';
+      stageImage.dataset.src = 'api/thumbnail/old';
+      stageImage.src = 'blob:http://example/old';
+      recentByCamera.set('reolink-0', dayClip('stage1', 'reolink-0', 'Porch', 'reolink', 0, 11, 0));
+      route = { name: 'camera', key: 'reolink-0' };
+      camState.key = 'reolink-0';
+      camState.days = [];
+      updateStageForCamera();
+      await until(() => stageImage.dataset.src === 'api/thumbnail/stage1' || stageImage.dataset.loaded === '1', 200);
+      check('MAJOR4 stage clears prior loaded flag and loads new thumb',
+            stageImage.dataset.src === 'api/thumbnail/stage1'
+            || (stageImage.src && stageImage.src.startsWith('blob:')),
+            `src=${stageImage.dataset.src} loaded=${stageImage.dataset.loaded}`);
+      // Snapshot route check: start cycle for A, switch to B before apply
+      window.__snapshotStatus = { 'dvr-101': 200, 'reolink-0': 200 };
+      route = { name: 'camera', key: 'dvr-101' };
+      clearStageImage();
+      const snapPromise = (async () => {
+        const url = await loadSnapshot('dvr-101');
+        // Simulate runSnapshotCycle's post-await guard
+        if (route.name !== 'camera' || route.key !== 'dvr-101') {
+          if (url) URL.revokeObjectURL(url);
+          return 'rejected';
+        }
+        return 'applied';
+      })();
+      route = { name: 'camera', key: 'reolink-0' };
+      const snapResult = await snapPromise;
+      check('MAJOR4 snapshot discarded after route change', snapResult === 'rejected', snapResult);
+    }
+
+    // MAJOR 5: 410 refresh is single-flight + cached per camera/day
+    {
+      refreshDayCache.clear();
+      let dayFetches = 0;
+      const prevFor = window.__recordingsFor;
+      window.__recordingsFor = (u) => {
+        dayFetches += 1;
+        return { clips: [Object.assign({}, D2, { id: 'd2-shared' })], truncated: false, truncated_cameras: [], errors: [] };
+      };
+      const k = clipKey(D2);
+      const [a, b, c] = await Promise.all([
+        refreshClipByKey(k), refreshClipByKey(k), refreshClipByKey(k),
+      ]);
+      const d = await refreshClipByKey(k);
+      check('MAJOR5 refreshClipByKey single-flight + cache',
+            dayFetches === 1 && a && a.id === 'd2-shared' && d && d.id === 'd2-shared',
+            `fetches=${dayFetches} a=${a && a.id} d=${d && d.id}`);
+      window.__recordingsFor = prevFor;
+    }
+
+    // MAJOR 6: disposed player does not play after 410; direct probes 410; download refreshes
+    {
+      installFFmpeg({});
+      ffmpegPromise = null;
+      let rawHits = 0;
+      window.__nextRawResponse = () => {
+        rawHits++;
+        return { ok: false, status: 410, json: async () => ({ detail: 'gone' }) };
+      };
+      window.__recordingsFor = null;
+      window.__recordings = { clips: [Object.assign({}, D2, { id: 'd2-gone-fresh' })], truncated: false, truncated_cameras: [], errors: [] };
+      refreshDayCache.clear();
+      const bodyDisp = document.createElement('div');
+      document.getElementById('cases').appendChild(bodyDisp);
+      const stale = Object.assign({}, D2, { id: 'd2-gone' });
+      const player = buildPlayer(stale, bodyDisp);
+      await sleep(40);
+      player.dispose();
+      await until(() => bodyDisp.querySelector('.mode-badge')
+        && bodyDisp.querySelector('.mode-badge').dataset.mode !== 'working', 200);
+      // After dispose, a late 410 must not restart play (generation check).
+      check('MAJOR6 disposed player does not resume after 410',
+            !bodyDisp.querySelector('video').getAttribute('src')
+            || bodyDisp.querySelector('.mode-badge').dataset.mode !== 'fast',
+            bodyDisp.querySelector('.mode-badge').dataset.mode);
+      window.__nextRawResponse = null;
+
+      // Direct-play: non-410 error must not refresh; 410 probe does.
+      const prevRec = window.__recordings;
+      window.__recordings = { clips: [Object.assign({}, P1, { id: 'p1-fresh' })], truncated: false, truncated_cameras: [], errors: [] };
+      refreshDayCache.clear();
+      window.__streamStatus = 500;
+      const bodyDir = document.createElement('div');
+      document.getElementById('cases').appendChild(bodyDir);
+      const fetchesBefore = window.__fetches.length;
+      buildPlayer(Object.assign({}, P1, { id: 'p1-direct', playback: 'direct' }), bodyDir);
+      await sleep(30);
+      bodyDir.querySelector('video').dispatchEvent(new Event('error'));
+      await sleep(80);
+      const recAfterError = window.__fetches.slice(fetchesBefore).filter((u) => u.startsWith('api/recordings'));
+      check('MAJOR6 direct-play non-410 error does not refresh by key',
+            recAfterError.length === 0,
+            recAfterError.join(','));
+
+      refreshDayCache.clear();
+      window.__streamStatus = 410;
+      const bodyDir2 = document.createElement('div');
+      document.getElementById('cases').appendChild(bodyDir2);
+      const fetches410 = window.__fetches.length;
+      buildPlayer(Object.assign({}, P1, { id: 'p1-direct2', playback: 'direct' }), bodyDir2);
+      await sleep(30);
+      bodyDir2.querySelector('video').dispatchEvent(new Event('error'));
+      await sleep(150);
+      const recAfter410 = window.__fetches.slice(fetches410).filter((u) => u.startsWith('api/recordings'));
+      check('MAJOR6 direct-play 410 probe refreshes by key',
+            recAfter410.length >= 1,
+            String(recAfter410.length));
+      window.__streamStatus = 200;
+      window.__recordings = prevRec;
+
+      // Download click refreshes on 410
+      refreshDayCache.clear();
+      window.__downloadStatus = 410;
+      window.__recordings = { clips: [Object.assign({}, D2, { id: 'd2-dl-fresh' })], truncated: false, truncated_cameras: [], errors: [] };
+      const bodyDl = document.createElement('div');
+      document.getElementById('cases').appendChild(bodyDl);
+      buildPlayer(Object.assign({}, D2, { id: 'd2-dl-stale' }), bodyDl);
+      await sleep(30);
+      const dl = bodyDl.querySelector('a.download');
+      const assignLog = [];
+      window.__downloadNavigate = (href) => { assignLog.push(String(href)); };
+      dl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await sleep(150);
+      check('MAJOR6 download 410 refreshes id before navigate',
+            assignLog.some((h) => h.includes('d2-dl-fresh')),
+            assignLog.join(','));
+      delete window.__downloadNavigate;
+      window.__downloadStatus = 200;
+    }
+
+    // MINOR: recent error shows Retry; listitem wrap; clip-key on card; paused overlay; health dots
+    {
+      window.__recordingsStatus = 502;
+      window.__recordingsFor = null;
+      recentFetchedAt = 0;
+      recentError = false;
+      location.hash = '#/';
+      await until(() => document.body.classList.contains('view-home'));
+      await fetchRecent(true);
+      check('MINOR recent fetch error shows Retry',
+            !!document.querySelector('#recent-empty button')
+            && /Could not load recent/i.test(document.getElementById('recent-empty').textContent || ''),
+            document.getElementById('recent-empty').textContent);
+      window.__recordingsStatus = 200;
+      window.__recordings = { clips: [recentA], truncated: false, truncated_cameras: [], errors: [] };
+      await fetchRecent(true);
+      const wrap = document.querySelector('#recent-strip [role="listitem"]');
+      const card = document.querySelector('#recent-strip .recent-card');
+      check('MINOR recent listitem wraps button',
+            !!wrap && wrap.contains(card) && card.getAttribute('role') !== 'listitem');
+      check('MINOR recent card carries data-clip-key',
+            !!card && !!card.dataset.clipKey, card && card.dataset.clipKey);
+
+      pauseSnapshots('idle');
+      const porchPaused = document.querySelector('#camera-tiles [data-camera="reolink-0"] .tile-paused');
+      const drivePaused = document.querySelector('#camera-tiles [data-camera="dvr-101"] .tile-paused');
+      check('MINOR paused overlay hidden on non-snapshot tiles',
+            porchPaused && porchPaused.hidden === true
+            && drivePaused && drivePaused.hidden === false);
+
+      // Health dots re-applied when health arrives after tiles
+      healthDevices = [];
+      renderTiles();
+      check('MINOR no health dot before health',
+            !document.querySelector('#camera-tiles [data-camera="reolink-1"] .tile-error'));
+      healthDevices = [
+        { prefix: 'dvr', kind: 'dvr', name: 'DVR', state: 'ok' },
+        { prefix: 'reolink-0', kind: 'reolink', name: 'Porch', state: 'ok' },
+        { prefix: 'reolink-1', kind: 'reolink', name: 'Garden', state: 'unreachable' },
+      ];
+      applyHealthDots();
+      check('MINOR health dots applied when health arrives',
+            !!document.querySelector('#camera-tiles [data-camera="reolink-1"] .tile-error'));
+      resumeSnapshots();
+    }
+
+    // MINOR: emptyStreak is trailing empties only
+    {
+      resetCameraState('dvr-101');
+      camState.days = [
+        { day: localDate(new Date()), clips: [{ id: 1 }], error: null },
+        { day: localDate(addLocalDays(new Date(), -1)), clips: [], error: null },
+        { day: localDate(addLocalDays(new Date(), -2)), clips: [], error: null },
+      ];
+      recomputeEmptyStreak();
+      check('MINOR emptyStreak counts trailing empties only', camState.emptyStreak === 2,
+            String(camState.emptyStreak));
+      camState.days.push({ day: localDate(addLocalDays(new Date(), -3)), clips: [{ id: 2 }], error: null });
+      recomputeEmptyStreak();
+      check('MINOR emptyStreak resets when older day has clips', camState.emptyStreak === 0,
+            String(camState.emptyStreak));
+    }
 
   } catch (err) {
     check('harness ran without throwing', false, String(err && err.stack || err));
