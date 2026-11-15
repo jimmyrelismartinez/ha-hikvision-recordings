@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>app.js playback fallback tests</title></head>
-<body>
+<body class="view-all">
 <!--
   Exercises the REAL hikvision_recordings/www/app.js — not a copy — against stubbed
   ffmpeg.wasm and fetch. What is being pinned:
@@ -19,28 +19,60 @@
 <pre id="log"></pre>
 
 <!-- The DOM app.js binds to at load. Ids must match www/index.html. -->
+<nav><a href="#/" id="tab-cameras"></a><a href="#/all" id="tab-all"></a></nav>
+<span id="status"></span>
+<section id="view-home" hidden>
+  <div id="recent-strip"></div>
+  <p id="recent-empty" hidden></p>
+  <div id="camera-tiles"></div>
+</section>
+<section id="view-camera" hidden>
+  <a href="#/" id="camera-back"></a>
+  <h2 id="camera-title"></h2>
+  <button type="button" id="live-button" hidden>● Live</button>
+  <button type="button" id="date-chip">Today</button>
+  <input type="date" id="date-jump">
+  <div id="event-filters" hidden></div>
+  <button type="button" id="refresh-today"></button>
+  <div id="vtimeline"></div>
+  <div id="day-sentinel" hidden></div>
+  <p id="camera-end" hidden></p>
+  <button type="button" id="load-earlier" hidden></button>
+</section>
+<section id="view-all">
 <form id="search-form">
   <div id="camera-chips"></div>
   <input type="date" id="date"><input type="time" id="from"><input type="time" id="to">
   <button type="submit" id="search-button"></button>
 </form>
-<p id="message"></p><span id="status"></span>
+<p id="message"></p>
+<div id="banners"></div><div id="timeline" hidden></div>
+<ul id="results"></ul><button type="button" id="show-more" hidden></button>
+</section>
 <section id="player-panel" hidden>
   <span id="player-camera"></span><span id="player-time"></span>
   <button type="button" id="player-close"></button>
+  <div id="stage-live" hidden>
+    <img id="stage-image" alt="">
+    <p id="stage-label"></p>
+    <p id="stage-paused" hidden></p>
+  </div>
   <div id="player-body"></div>
-  <button type="button" id="prev-clip"></button>
-  <input type="checkbox" id="autoplay">
-  <button type="button" id="next-clip"></button>
+  <div class="player-nav">
+    <button type="button" id="prev-clip"></button>
+    <input type="checkbox" id="autoplay">
+    <button type="button" id="next-clip"></button>
+  </div>
 </section>
-<div id="banners"></div><div id="timeline" hidden></div>
-<ul id="results"></ul><button type="button" id="show-more" hidden></button>
 <div id="cases"></div>
 
 <script>
 // ── stubs, installed before app.js runs ──────────────────────────────────────
 window.__fetches = [];
 window.__nextRawResponse = null;
+window.__thumbInflightPeak = 0;
+window.__snapshotStatus = {};  // cameraKey -> status (default 200)
+window.__recordingsFor = null; // optional (url) => body override
 
 // Preferences persist in the test browser profile — start every run clean.
 try { localStorage.clear(); } catch (err) { /* ignore */ }
@@ -51,22 +83,54 @@ window.__recordings = { clips: [], truncated: false, truncated_cameras: [], erro
 window.__aborted = [];
 window.__rawDelay = 0;
 window.__recordingsStatus = 200;
+window.__thumbDelay = 0;
+window.__thumbStatus = 200;
 
 window.fetch = async (url, options) => {
   window.__fetches.push(String(url));
   if (String(url).startsWith('api/channels')) {
     return { ok: true, json: async () => [
-      { id: 'dvr-101', key: 'dvr-101', name: 'Driveway', kind: 'dvr' },
-      { id: 'reolink-0', key: 'reolink-0', name: 'Porch', kind: 'reolink' },
+      { id: 'dvr-101', key: 'dvr-101', name: 'Driveway', kind: 'dvr', snapshot: true },
+      { id: 'reolink-0', key: 'reolink-0', name: 'Porch', kind: 'reolink', snapshot: false },
+      { id: 'reolink-1', key: 'reolink-1', name: 'Garden', kind: 'reolink', snapshot: false },
     ] };
   }
   if (String(url).startsWith('api/health')) {
-    return { ok: true, json: async () => ({ dvr: 'ok', devices: [] }) };
+    return { ok: true, json: async () => ({
+      dvr: 'ok',
+      ha_api: 'ok',
+      devices: [
+        { prefix: 'dvr', kind: 'dvr', name: 'DVR', state: 'ok' },
+        { prefix: 'reolink-0', kind: 'reolink', name: 'Porch', state: 'ok' },
+        { prefix: 'reolink-1', kind: 'reolink', name: 'Garden', state: 'unreachable' },
+      ],
+    }) };
   }
   if (String(url).startsWith('api/recordings')) {
+    if (typeof window.__recordingsFor === 'function') {
+      const body = window.__recordingsFor(String(url));
+      return { ok: true, status: 200, json: async () => body };
+    }
     const status = window.__recordingsStatus;
     return { ok: status < 400, status,
              json: async () => (status < 400 ? window.__recordings : { detail: 'Search failed upstream.' }) };
+  }
+  if (String(url).startsWith('api/snapshot/')) {
+    const key = String(url).split('?')[0].slice('api/snapshot/'.length);
+    const status = window.__snapshotStatus[key] ?? 200;
+    if (status >= 400) return { ok: false, status, blob: async () => new Blob() };
+    return { ok: true, status: 200, blob: async () => new Blob([new Uint8Array([1,2,3])], { type: 'image/jpeg' }) };
+  }
+  if (String(url).startsWith('api/thumbnail/')) {
+    window.__thumbInflightPeak = Math.max(window.__thumbInflightPeak, thumbInflight || 0);
+    if (window.__thumbDelay) await new Promise((r) => setTimeout(r, window.__thumbDelay));
+    const status = window.__thumbStatus;
+    if (status === 410) {
+      window.__thumbStatus = 200;
+      return { ok: false, status: 410, blob: async () => new Blob() };
+    }
+    if (status >= 400) return { ok: false, status, blob: async () => new Blob() };
+    return { ok: true, status: 200, blob: async () => new Blob([new Uint8Array([9,9])], { type: 'image/jpeg' }) };
   }
   if (String(url).startsWith('api/stream-raw')) {
     // A slow, abortable download — like a real DVR clip of tens of MB.
@@ -83,6 +147,9 @@ window.fetch = async (url, options) => {
     }
     if (window.__nextRawResponse) return window.__nextRawResponse();
     return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
+  }
+  if (String(url).startsWith('api/stream/') || String(url).startsWith('api/download/')) {
+    return { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0) };
   }
   throw new Error('unexpected fetch ' + url);
 };
@@ -234,6 +301,10 @@ async function runCase({ clip, behaviour, raw, quality }) {
       for (let i = 0; i < tries && !cond(); i++) await sleep(25);
       return cond();
     }
+    // v0.5: All-recordings behaviour lives on #/all.
+    location.hash = '#/all';
+    await until(() => document.body.classList.contains('view-all') && !document.getElementById('view-all').hidden);
+
     const chip = (key) => document.querySelector(`#camera-chips [data-camera="${key}"]`);
     const recordingsFetches = () => window.__fetches.filter((u) => u.startsWith('api/recordings'));
     async function search() {
@@ -244,16 +315,17 @@ async function runCase({ clip, behaviour, raw, quality }) {
       return recordingsFetches().slice(-1)[0] || '';
     }
     const iso = (h, m) => { const d = new Date(); d.setHours(h, m, 0, 0); return d.toISOString(); };
-    const clipAt = (id, key, name, kind, h, m) => ({
+    const clipAt = (id, key, name, kind, h, m, events) => ({
       id, channel: key, camera_key: key, channel_name: name, camera_name: name, kind,
       playback: kind === 'reolink' ? 'direct' : 'remux',
       start: iso(h, m), end: iso(h, m + 2), duration_s: 120,
       size_bytes: 4 * 1024 * 1024, has_sub: true,
+      events: events || [],
     });
     // Newest first, exactly as the API sends them; two cameras interleaved in time.
-    const P1 = clipAt('p1', 'reolink-0', 'Porch', 'reolink', 10, 0);
-    const D2 = clipAt('d2', 'dvr-101', 'Driveway', 'dvr', 10, 10);
-    const P3 = clipAt('p3', 'reolink-0', 'Porch', 'reolink', 10, 20);
+    const P1 = clipAt('p1', 'reolink-0', 'Porch', 'reolink', 10, 0, ['person']);
+    const D2 = clipAt('d2', 'dvr-101', 'Driveway', 'dvr', 10, 10, ['motion']);
+    const P3 = clipAt('p3', 'reolink-0', 'Porch', 'reolink', 10, 20, ['vehicle']);
     window.__recordings = { clips: [P3, D2, P1], truncated: false, truncated_cameras: [], errors: [] };
     installFFmpeg({});
     ffmpegPromise = null;
@@ -265,7 +337,7 @@ async function runCase({ clip, behaviour, raw, quality }) {
     await until(() => chip('all'));
     check('chips: All plus one per camera',
           [...document.querySelectorAll('#camera-chips .chip')].map((c) => c.textContent).join(',')
-            === 'All,Driveway,Porch',
+            === 'All,Driveway,Porch,Garden',
           [...document.querySelectorAll('#camera-chips .chip')].map((c) => c.textContent).join(','));
     check('chips: All is selected by default', chip('all').getAttribute('aria-pressed') === 'true');
 
@@ -283,14 +355,15 @@ async function runCase({ clip, behaviour, raw, quality }) {
           JSON.stringify(loadPref(STORE.cameras, null)) === '["reolink-0"]',
           JSON.stringify(loadPref(STORE.cameras, null)));
     chip('dvr-101').click();
+    chip('reolink-1').click();
     check('picking every camera collapses back to All',
           chip('all').getAttribute('aria-pressed') === 'true');
     url = await search();
     check('… and searches camera=all', url.includes('camera=all'), url);
 
-    // Timeline
+    // Timeline — one lane per camera in the selection (All → every configured camera).
     const lanes = [...document.querySelectorAll('#timeline .tl-row:not(.tl-axis)')];
-    check('timeline: one lane per camera', lanes.length === 2, String(lanes.length));
+    check('timeline: one lane per camera', lanes.length === 3, String(lanes.length));
     check('timeline: every clip drawn as a segment',
           document.querySelectorAll('#timeline .tl-seg').length === 3,
           String(document.querySelectorAll('#timeline .tl-seg').length));
@@ -462,7 +535,8 @@ async function runCase({ clip, behaviour, raw, quality }) {
     document.getElementById('player-close').click();
     await sleep(400);
     check('closing mid-remux aborts the download', window.__aborted.length === 1, window.__aborted.join(','));
-    check('… and nothing is left playing', panel.hidden && !pvideo());
+    // The shared <video> stays in the panel (never detached); close just disposes playback.
+    check('… and nothing is left playing', panel.hidden && current === null);
     window.__rawDelay = 0;
 
     // Reused <video> stays attached between clips (fullscreen survives autoplay).
@@ -507,6 +581,375 @@ async function runCase({ clip, behaviour, raw, quality }) {
     moreBtn.click();
     check('Show more renders the rest', document.querySelectorAll('#results .clip').length === 250);
     check('Show more hides when done', moreBtn.hidden === true);
+
+    // ── v0.5.0: routing, home, camera page, filters, snapshots, thumbs ────────
+    const dayIso = (offsetDays, h, m) => {
+      const d = new Date();
+      d.setDate(d.getDate() + offsetDays);
+      d.setHours(h, m, 0, 0);
+      return d.toISOString();
+    };
+    const dayClip = (id, key, name, kind, offsetDays, h, m, events) => ({
+      id, camera_key: key, channel: key, camera_name: name, channel_name: name, kind,
+      playback: kind === 'reolink' ? 'direct' : 'remux',
+      start: dayIso(offsetDays, h, m),
+      end: dayIso(offsetDays, h, m + 1),
+      duration_s: 60, size_bytes: 2 * 1024 * 1024, has_sub: true,
+      events: events || ['motion'],
+    });
+
+    // Routing
+    location.hash = '#/';
+    await until(() => document.body.classList.contains('view-home'));
+    check('route #/ shows home', !document.getElementById('view-home').hidden
+          && document.getElementById('view-all').hidden
+          && document.getElementById('view-camera').hidden);
+    location.hash = '#/nope';
+    await until(() => location.hash === '#/' || document.body.classList.contains('view-home'));
+    await sleep(50);
+    check('unknown hash redirects to home', document.body.classList.contains('view-home'));
+
+    // Home: recent strip + tiles (snapshot vs thumbnail fallback)
+    const recentA = dayClip('r1', 'reolink-0', 'Porch', 'reolink', 0, 12, 0, ['person']);
+    const recentB = dayClip('r2', 'dvr-101', 'Driveway', 'dvr', 0, 11, 30, ['motion']);
+    window.__recordings = { clips: [recentA, recentB], truncated: false, truncated_cameras: [], errors: [] };
+    recentFetchedAt = 0;
+    await fetchRecent(true);
+    check('recent strip renders cards', document.querySelectorAll('#recent-strip .recent-card').length === 2,
+          String(document.querySelectorAll('#recent-strip .recent-card').length));
+    check('home tiles: one per camera', document.querySelectorAll('#camera-tiles .camera-tile').length === 3);
+    check('home tiles: Garden shows error dot when device down',
+          !!document.querySelector('#camera-tiles [data-camera="reolink-1"] .tile-error'));
+    // Snapshot for Driveway (linked); Porch falls back to thumbnail src.
+    window.__snapshotStatus = { 'dvr-101': 200 };
+    await runSnapshotCycle();
+    await sleep(50);
+    check('home tile with snapshot:true gets a snapshot image',
+          !!document.querySelector('#camera-tiles [data-camera="dvr-101"] .tile-img').src,
+          document.querySelector('#camera-tiles [data-camera="dvr-101"] .tile-img').src);
+    const porchImg = document.querySelector('#camera-tiles [data-camera="reolink-0"] .tile-img');
+    check('home tile without snapshot uses thumbnail dataset',
+          porchImg.dataset.src === 'api/thumbnail/r1', porchImg.dataset.src);
+
+    // Snapshot polling pauses when hidden
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await sleep(30);
+    check('snapshot polling pauses when document hidden', snapState.paused === true);
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    resumeSnapshots();
+    await sleep(30);
+    check('tap resumes snapshots after pause', snapState.paused === false);
+
+    // Idle pause: force lastInteraction old
+    lastInteraction = Date.now() - (3 * 60 * 1000);
+    clearSnapTimer();
+    scheduleSnapshots();
+    await sleep(30);
+    check('snapshot polling pauses after 2 min idle', snapState.paused === true);
+    noteInteraction();
+    await sleep(30);
+
+    // Recent card → openClip sync + camera route
+    const sharedVideoBefore = panelVideo;
+    window.__recordingsFor = (u) => {
+      // Camera day loads: return porch clips for today.
+      if (u.includes('reolink-0')) {
+        return { clips: [recentA, dayClip('r1b', 'reolink-0', 'Porch', 'reolink', 0, 10, 0, ['person'])],
+                 truncated: false, truncated_cameras: [], errors: [] };
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    document.querySelector('#recent-strip .recent-card').click();
+    await until(() => location.hash.startsWith('#/camera/reolink-0'));
+    await until(() => document.body.classList.contains('view-camera') && document.querySelector('#vtimeline .vrow'));
+    check('recent card navigates to camera route with ?t=',
+          /#\/camera\/reolink-0\?t=/.test(location.hash), location.hash);
+    check('recent card opens the clip (playing)', current && clipKey(current.clip) === clipKey(recentA),
+          current && current.clip && current.clip.id);
+    check('single <video> across views (same element)',
+          !!current && current.player.video === sharedVideoBefore
+          && document.querySelectorAll('#player-body video').length === 1,
+          `same=${current && current.player.video === sharedVideoBefore} n=${document.querySelectorAll('#player-body video').length}`);
+
+    // Camera page day load + date chip
+    check('camera page loads today rows', document.querySelectorAll('#vtimeline .vrow').length >= 1);
+    check('date chip shows Today', document.getElementById('date-chip').textContent === 'Today');
+
+    // Event filters: multiple types → chips shown; nav skips filtered
+    window.__recordingsFor = (u) => ({
+      clips: [
+        dayClip('f1', 'reolink-0', 'Porch', 'reolink', 0, 14, 0, ['person']),
+        dayClip('f2', 'reolink-0', 'Porch', 'reolink', 0, 13, 0, ['vehicle']),
+        dayClip('f3', 'reolink-0', 'Porch', 'reolink', 0, 12, 0, ['motion']),
+      ],
+      truncated: false, truncated_cameras: [], errors: [],
+    });
+    location.hash = '#/camera/reolink-0';
+    await until(() => document.querySelector('#vtimeline .vrow'));
+    await until(() => !document.getElementById('event-filters').hidden);
+    check('event filters shown when >1 type', document.getElementById('event-filters').hidden === false);
+    const personChip = [...document.querySelectorAll('#event-filters .chip')]
+      .find((c) => c.textContent === 'Person');
+    personChip.click();
+    await sleep(30);
+    check('filter hides non-matching cards',
+          [...document.querySelectorAll('#vtimeline .vrow-card')].filter((c) => !c.hidden).length === 1);
+    const personClip = camState.days.flatMap((d) => d.clips).find((c) => c.id === 'f1');
+    openClip(personClip);
+    await until(() => current && current.clip.id === 'f1');
+    nextBtn.click();
+    await sleep(80);
+    check('Later skips filtered-out clips', current && current.clip.id === 'f1',
+          current && current.clip && current.clip.id);
+    // Absent persisted filter falls back to All
+    savePref(STORE.filter('reolink-0'), 'doorbell');
+    check('persisted absent type stored', loadPref(STORE.filter('reolink-0'), null) === 'doorbell',
+          JSON.stringify(loadPref(STORE.filter('reolink-0'), null)));
+    location.hash = '#/';
+    await until(() => document.body.classList.contains('view-home') && !camState.key);
+    const genBefore = camState.generation;
+    location.hash = '#/camera/reolink-0';
+    await until(() => camState.key === 'reolink-0' && camState.generation !== genBefore
+                  && document.querySelector('#vtimeline .vrow'));
+    check('absent persisted filter falls back to All', camState.filter === 'all', camState.filter);
+
+    // Filters hidden when ≤1 type
+    window.__recordingsFor = (u) => ({
+      clips: [dayClip('m1', 'dvr-101', 'Driveway', 'dvr', 0, 9, 0, ['motion']),
+              dayClip('m2', 'dvr-101', 'Driveway', 'dvr', 0, 8, 0, ['motion'])],
+      truncated: false, truncated_cameras: [], errors: [],
+    });
+    location.hash = '#/camera/dvr-101';
+    await until(() => document.querySelector('#vtimeline .vrow'));
+    await sleep(50);
+    renderEventFilters();
+    check('event filters hidden when ≤1 type',
+          document.getElementById('event-filters').hidden === true
+          && typesInLoadedDays().length <= 1,
+          `hidden=${document.getElementById('event-filters').hidden} types=${typesInLoadedDays().join(',')}`);
+
+    // ● Live returns to snapshot
+    openClip(camState.days[0].clips[0]);
+    await until(() => current);
+    document.getElementById('live-button').click();
+    await sleep(40);
+    check('● Live returns to snapshot stage', current === null
+          && document.getElementById('stage-live').hidden === false
+          && document.getElementById('live-button').hidden === true);
+
+    // Infinite scroll stop rule (stubbed empty days) + failed day pauses
+    let dayCalls = [];
+    window.__recordingsFor = (u) => {
+      const start = new URL('http://x/' + u).searchParams.get('start');
+      dayCalls.push(start);
+      const startMs = Date.parse(start);
+      const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+      const daysBack = Math.round((today0 - new Date(startMs)) / 86400000);
+      if (daysBack === 0) {
+        return { clips: [dayClip('t0', 'dvr-101', 'Driveway', 'dvr', 0, 12, 0)], truncated: false, truncated_cameras: [], errors: [] };
+      }
+      if (daysBack === 1) {
+        return Promise.reject ? { clips: [], truncated: false, truncated_cameras: [], errors: [] } : { clips: [] };
+      }
+      // Force a failure on day -2 via status by throwing through a sentinel
+      if (daysBack === 2 && !window.__failDayDone) {
+        window.__failDayDone = true;
+        const err = { clips: [], detail: 'upstream' };
+        // Simulate by returning ok body but we'll use a custom path — instead mark via __forceFail
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    // Proper failed-day: wrap fetch for one call
+    window.__failDayDone = false;
+    const origRecFor = window.__recordingsFor;
+    let failOnce = true;
+    window.__recordingsFor = (u) => {
+      const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+      const startMs = Date.parse(start);
+      const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+      const daysBack = Math.round((today0.getTime() - startOfLocalDay(new Date(startMs)).getTime()) / 86400000);
+      dayCalls.push(daysBack);
+      if (daysBack === 0) {
+        return { clips: [dayClip('t0', 'dvr-101', 'Driveway', 'dvr', 0, 12, 0, ['motion', 'person'])],
+                 truncated: false, truncated_cameras: [], errors: [] };
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    location.hash = '#/camera/dvr-101';
+    await until(() => document.querySelector('#vtimeline .vrow'));
+    // Manually load older empty days until stop
+    for (let i = 0; i < 10; i++) {
+      if (camState.stopped) break;
+      await loadNextOlderDay();
+    }
+    check('infinite scroll stop after 7 consecutive empty days',
+          camState.stopped === true && /No older recordings/.test(document.getElementById('camera-end').textContent || ''),
+          `stopped=${camState.stopped} streak=${camState.emptyStreak}`);
+
+    // Failed day pauses auto-load
+    resetCameraState('dvr-101');
+    window.__recordingsStatus = 200;
+    const realFetch = window.fetch;
+    let failDay = true;
+    window.fetch = async (url, options) => {
+      if (String(url).startsWith('api/recordings') && failDay) {
+        const start = new URLSearchParams(String(url).split('?')[1] || '').get('start');
+        const startMs = Date.parse(start);
+        const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+        const daysBack = Math.round((today0.getTime() - startOfLocalDay(new Date(startMs)).getTime()) / 86400000);
+        if (daysBack === 1) {
+          failDay = false;
+          return { ok: false, status: 502, json: async () => ({ detail: 'DVR unreachable' }) };
+        }
+      }
+      return realFetch(url, options);
+    };
+    window.__recordingsFor = (u) => {
+      const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+      const startMs = Date.parse(start);
+      const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+      const daysBack = Math.round((today0.getTime() - startOfLocalDay(new Date(startMs)).getTime()) / 86400000);
+      if (daysBack === 0) {
+        return { clips: [dayClip('t0', 'dvr-101', 'Driveway', 'dvr', 0, 12, 0)], truncated: false, truncated_cameras: [], errors: [] };
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    await loadDay(startOfLocalDay(new Date()));
+    await loadNextOlderDay(); // yesterday fails via patched fetch — but __recordingsFor short-circuits!
+    // Bypass __recordingsFor for failure test
+    window.__recordingsFor = null;
+    resetCameraState('dvr-101');
+    failDay = true;
+    await loadDay(startOfLocalDay(new Date()));
+    await loadDay(addLocalDays(startOfLocalDay(new Date()), -1));
+    renderVTimeline();
+    check('failed day pauses auto-load', camState.pausedAuto === true, String(camState.pausedAuto));
+    check('failed day shows retry row', !!document.querySelector('.vday-error'), 'no retry row');
+    window.fetch = realFetch;
+    window.__recordingsFor = null;
+    window.__recordingsStatus = 200;
+
+    // Dedupe by clipKey across days (midnight-spanning clip listed for both days)
+    resetCameraState('reolink-0');
+    const spanStart = new Date(); spanStart.setHours(23, 50, 0, 0);
+    const spanEnd = new Date(spanStart.getTime() + 20 * 60000);
+    const spanning = {
+      id: 'span1', camera_key: 'reolink-0', camera_name: 'Porch', kind: 'reolink', playback: 'direct',
+      start: spanStart.toISOString(), end: spanEnd.toISOString(), duration_s: 1200,
+      size_bytes: 1024, has_sub: true, events: ['motion'],
+    };
+    window.__recordingsFor = (u) => {
+      const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+      const end = new URLSearchParams(u.split('?')[1] || '').get('end');
+      // Both today and tomorrow-ish windows include the spanning clip
+      return { clips: [spanning], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    await loadDay(startOfLocalDay(new Date()));
+    await loadDay(addLocalDays(startOfLocalDay(new Date()), 1)); // "tomorrow" won't apply; use yesterday + today
+    // Load same clip via "yesterday" window that still returns it
+    const beforeKeys = camState.seenKeys.size;
+    await loadDay(addLocalDays(startOfLocalDay(new Date()), -1));
+    // Second load of today should not duplicate
+    const sizeBefore = camState.seenKeys.size;
+    await loadDay(startOfLocalDay(new Date())); // already loaded — early return
+    check('dedupe by clipKey across days', camState.seenKeys.size === 1, String(camState.seenKeys.size));
+    renderVTimeline();
+    check('spanning clip shown once', document.querySelectorAll(`#vtimeline .vrow[data-clip-id="span1"]`).length === 1,
+          String(document.querySelectorAll(`#vtimeline .vrow[data-clip-id="span1"]`).length));
+
+    // Earlier/Later across days
+    const xd0 = dayClip('xd0', 'reolink-0', 'Porch', 'reolink', 0, 15, 0, ['person']);
+    const xd1 = dayClip('xd1', 'reolink-0', 'Porch', 'reolink', -1, 15, 0, ['person']);
+    window.__recordingsFor = (u) => {
+      const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+      const day = localDate(new Date(start));
+      if (day === localDate(new Date(xd0.start))) {
+        return { clips: [xd0], truncated: false, truncated_cameras: [], errors: [] };
+      }
+      if (day === localDate(new Date(xd1.start))) {
+        return { clips: [xd1], truncated: false, truncated_cameras: [], errors: [] };
+      }
+      return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+    };
+    location.hash = '#/';
+    await until(() => document.body.classList.contains('view-home') && !camState.key);
+    resetCameraState('reolink-0');
+    await loadDay(startOfLocalDay(new Date(xd0.start)));
+    await loadDay(startOfLocalDay(new Date(xd1.start)));
+    renderEventFilters();
+    renderVTimeline();
+    const older = camState.days.flatMap((d) => d.clips).find((c) => c.id === 'xd1');
+    const newer = camState.days.flatMap((d) => d.clips).find((c) => c.id === 'xd0');
+    check('cross-day fixtures loaded', !!older && !!newer,
+          `older=${older && older.id} newer=${newer && newer.id} days=${camState.days.map((d) => d.day + ':' + d.clips.length).join('|')}`);
+    route = { name: 'camera', key: 'reolink-0' };
+    if (older && newer) {
+      openClip(older);
+      await until(() => current && current.clip.id === 'xd1');
+      nextBtn.click();
+      await until(() => current && current.clip.id === 'xd0');
+      check('Later crosses days', current && current.clip.id === 'xd0', current && current.clip && current.clip.id);
+      prevBtn.click();
+      await until(() => current && current.clip.id === 'xd1');
+      check('Earlier crosses days', current && current.clip.id === 'xd1', current && current.clip && current.clip.id);
+    } else {
+      check('Later crosses days', false, 'missing fixtures');
+      check('Earlier crosses days', false, 'missing fixtures');
+    }
+
+    // Date chip jump
+    document.getElementById('date-jump').value = localDate(addLocalDays(new Date(), -1));
+    document.getElementById('date-jump').dispatchEvent(new Event('change'));
+    await until(() => document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -1))}"]`));
+    check('date chip jump loads that day',
+          !!document.querySelector(`.vday[data-day="${localDate(addLocalDays(new Date(), -1))}"]`));
+
+    // 410 retry by clipKey
+    window.__recordingsFor = null;
+    window.__recordings = { clips: [Object.assign({}, D2, { id: 'd2-fresh' })], truncated: false, truncated_cameras: [], errors: [] };
+    let rawHits = 0;
+    window.__nextRawResponse = () => {
+      rawHits++;
+      if (rawHits === 1) return { ok: false, status: 410, json: async () => ({ detail: 'gone' }) };
+      return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
+    };
+    location.hash = '#/all';
+    await until(() => document.body.classList.contains('view-all'));
+    installFFmpeg({});
+    ffmpegPromise = null;
+    const body410 = document.createElement('div');
+    document.getElementById('cases').appendChild(body410);
+    const stale = Object.assign({}, D2, { id: 'd2-stale' });
+    buildPlayer(stale, body410);
+    await until(() => body410.querySelector('.mode-badge')
+      && body410.querySelector('.mode-badge').dataset.mode
+      && body410.querySelector('.mode-badge').dataset.mode !== 'working', 300);
+    check('410 retry by clipKey succeeds on second id',
+          body410.querySelector('.mode-badge').dataset.mode === 'fast' && rawHits >= 2,
+          `mode=${body410.querySelector('.mode-badge').dataset.mode} hits=${rawHits}`);
+    window.__nextRawResponse = null;
+
+    // Thumbnail in-flight cap of 2
+    window.__thumbDelay = 80;
+    window.__thumbInflightPeak = 0;
+    const peakBefore = 0;
+    const box = document.createElement('div');
+    document.getElementById('cases').appendChild(box);
+    for (let i = 0; i < 6; i++) {
+      const wrap = document.createElement('div');
+      box.appendChild(wrap);
+      attachThumb(wrap, { id: `th${i}`, camera_key: 'reolink-0', start: iso(10, i) });
+      // Force enqueue without waiting for observer
+      const img = wrap.querySelector('img');
+      if (thumbObserver) thumbObserver.unobserve(img);
+      enqueueThumb(img);
+    }
+    await sleep(40);
+    check('thumbnail in-flight cap of 2', thumbInflight <= 2, String(thumbInflight));
+    await sleep(500);
+    window.__thumbDelay = 0;
+
   } catch (err) {
     check('harness ran without throwing', false, String(err && err.stack || err));
   }
