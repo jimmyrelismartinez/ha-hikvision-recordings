@@ -31,11 +31,12 @@ def client() -> httpx.Client:
     )
 
 
-def search_body(channel: int, start: str, end: str, max_results: int, position: int) -> str:
+def search_body(channel: int, start: str, end: str, max_results: int, position: int,
+                search_id: str | None = None) -> str:
     # searchID MUST be a uuid4 — see design spec 3.2. Anything else -> badXmlContent.
     return (
         "<CMSearchDescription>"
-        f"<searchID>{uuid.uuid4()}</searchID>"
+        f"<searchID>{search_id or uuid.uuid4()}</searchID>"
         f"<trackIDList><trackID>{channel}</trackID></trackIDList>"
         f"<timeSpanList><timeSpan><startTime>{start}</startTime>"
         f"<endTime>{end}</endTime></timeSpan></timeSpanList>"
@@ -49,6 +50,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--channel", type=int, default=101)
     ap.add_argument("--hours", type=int, default=6)
+    ap.add_argument("--page-size", type=int, default=0,
+                    help="if set, walk searchResultPosition in pages of this size (Q5)")
+    ap.add_argument("--max-pages", type=int, default=10)
     args = ap.parse_args()
 
     now_utc = datetime.now(timezone.utc)
@@ -75,6 +79,33 @@ def main() -> int:
         print("[hint] Look for a picture/thumbnail element inside <searchMatchItem>.")
         print("[hint] Look for the paging/total field name (numOfMatches / totalMatches / "
               "responseStatusStrg='MORE'). Whatever it is called, copy it EXACTLY.")
+
+        # --- Q5: paging — does searchResultPosition walk the result set? ---
+        # Small pages over a WIDE window (it numerically spans both time hypotheses —
+        # fine here, we only care about paging, not timestamps). The same searchID is
+        # reused across pages: it is the paging handle.
+        if args.page_size:
+            import re
+            sid = str(uuid.uuid4())
+            seen: list[str] = []
+            for page in range(args.max_pages):
+                page_body = search_body(args.channel, start, end, args.page_size,
+                                        page * args.page_size, search_id=sid)
+                pr = c.post(SEARCH_PATH, content=page_body.encode(),
+                            headers={"Content-Type": "application/xml"})
+                status = re.search(r"<responseStatusStrg>(.*?)<", pr.text)
+                matches = re.search(r"<numOfMatches>(.*?)<", pr.text)
+                starts = re.findall(r"<startTime>(.*?)</startTime>", pr.text)
+                dupes = sorted(set(starts) & set(seen))
+                seen.extend(starts)
+                print(f"\n=== Q5 page {page} pos={page * args.page_size} -> HTTP {pr.status_code} "
+                      f"status={status.group(1) if status else None!r} "
+                      f"numOfMatches={matches.group(1) if matches else None!r} "
+                      f"items={len(starts)} first={starts[:1]} last={starts[-1:]} "
+                      f"overlap_with_previous_pages={len(dupes)}")
+                if not status or status.group(1) != "MORE":
+                    break
+            print(f"[Q5] total distinct items across pages: {len(set(seen))} of {len(seen)}")
 
         # --- Q3: does download honour Range? ---
         uri = None
