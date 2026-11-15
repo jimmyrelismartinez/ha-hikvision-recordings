@@ -39,7 +39,7 @@ from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import THUMB_MAX_BYTES, ThumbnailError, thumbnail_from_stream
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 

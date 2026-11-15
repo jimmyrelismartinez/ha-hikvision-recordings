@@ -20,11 +20,21 @@
 
 <!-- The DOM app.js binds to at load. Ids must match www/index.html. -->
 <form id="search-form">
-  <select id="channel"></select>
+  <div id="camera-chips"></div>
   <input type="date" id="date"><input type="time" id="from"><input type="time" id="to">
   <button type="submit" id="search-button"></button>
 </form>
-<p id="message"></p><span id="status"></span><ul id="results"></ul>
+<p id="message"></p><span id="status"></span>
+<section id="player-panel" hidden>
+  <span id="player-camera"></span><span id="player-time"></span>
+  <button type="button" id="player-close"></button>
+  <div id="player-body"></div>
+  <button type="button" id="prev-clip"></button>
+  <input type="checkbox" id="autoplay">
+  <button type="button" id="next-clip"></button>
+</section>
+<div id="banners"></div><div id="timeline" hidden></div>
+<ul id="results"></ul><button type="button" id="show-more" hidden></button>
 <div id="cases"></div>
 
 <script>
@@ -32,13 +42,25 @@
 window.__fetches = [];
 window.__nextRawResponse = null;
 
+// Preferences persist in the test browser profile — start every run clean.
+try { localStorage.clear(); } catch (err) { /* ignore */ }
+
+// Placeholder cameras only (privacy rule): never real names or addresses.
+window.__recordings = { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+
 window.fetch = async (url) => {
   window.__fetches.push(String(url));
   if (String(url).startsWith('api/channels')) {
-    return { ok: true, json: async () => [{ id: 101, name: 'DriveWay1' }] };
+    return { ok: true, json: async () => [
+      { id: 'dvr-101', key: 'dvr-101', name: 'Driveway', kind: 'dvr' },
+      { id: 'reolink-0', key: 'reolink-0', name: 'Porch', kind: 'reolink' },
+    ] };
   }
   if (String(url).startsWith('api/health')) {
-    return { ok: true, json: async () => ({ dvr: 'ok' }) };
+    return { ok: true, json: async () => ({ dvr: 'ok', devices: [] }) };
+  }
+  if (String(url).startsWith('api/recordings')) {
+    return { ok: true, json: async () => window.__recordings };
   }
   if (String(url).startsWith('api/stream-raw')) {
     if (window.__nextRawResponse) return window.__nextRawResponse();
@@ -185,50 +207,202 @@ async function runCase({ clip, behaviour, raw, quality }) {
     check('hd fallback -> compatibility mode', r.mode === 'compat', r.mode);
     check('hd fallback -> server path keeps quality=hd',
           r.src === 'api/stream/abc123?quality=hd', r.src);
-    // 10. THE PATH A USER ACTUALLY TAKES: renderClip() -> tap the row -> player.
-    //
-    // Everything above calls buildPlayer() directly, which is why this suite went
-    // green while Ramon's phone showed no picker and no badge at all. The real
-    // entry point is the click handler renderClip() attaches, and nothing was
-    // pinning it. (That specific incident was a stale cached app.js rather than a
-    // code fault, but the gap was real: this suite could not have told the
-    // difference.)
-    window.__fetches = [];
-    ffmpegPromise = null;
-    installFFmpeg({});
-    const row = renderClip({
-      id: 'row777', channel: 101, channel_name: 'DriveWay1',
-      start: new Date().toISOString(), end: new Date().toISOString(),
-      duration_s: 36, size_bytes: 4 * 1024 * 1024,
-    });
-    document.getElementById('cases').appendChild(row);
-
-    const bodyBefore = row.querySelector('.clip-body');
-    check('before the tap: player body is hidden', bodyBefore && bodyBefore.hidden === true,
-          String(bodyBefore && bodyBefore.hidden));
-    check('before the tap: no picker or badge exists yet',
-          !row.querySelector('.quality') && !row.querySelector('.mode-badge'));
-
-    row.querySelector('.clip-header').click();
-    const badgeAfter = () => row.querySelector('.mode-badge');
-    for (let i = 0; i < 200 && !(badgeAfter() && badgeAfter().dataset.mode
-                                 && badgeAfter().dataset.mode !== 'working'); i++) {
-      await new Promise((r) => setTimeout(r, 25));
+    // ── v0.3.0 page: chips, timeline, one player, forward-in-time nav ─────────
+    // These drive the page the way a user does — chips, Search, a tap on the
+    // timeline or a row — rather than calling buildPlayer() directly, because the
+    // entry points are what broke silently before (see git history for v0.1.x).
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    async function until(cond, tries = 200) {
+      for (let i = 0; i < tries && !cond(); i++) await sleep(25);
+      return cond();
     }
-    const bodyAfter = row.querySelector('.clip-body');
-    check('tapping the row reveals the player body', bodyAfter && bodyAfter.hidden === false,
-          String(bodyAfter && bodyAfter.hidden));
-    check('tapping the row renders the SD/HD picker', !!row.querySelector('.quality'));
-    check('picker offers exactly SD and HD',
-          [...row.querySelectorAll('.quality button')].map((b) => b.textContent).join(',') === 'SD,HD',
-          [...row.querySelectorAll('.quality button')].map((b) => b.textContent).join(','));
-    check('tapping the row renders the mode badge', !!badgeAfter());
-    check('badge reports a real path after the tap',
-          badgeAfter() && ['fast', 'compat'].includes(badgeAfter().dataset.mode),
-          badgeAfter() ? badgeAfter().dataset.mode : 'none');
-    check('picker and badge sit inside the clip body, not the list row',
-          bodyAfter && bodyAfter.contains(row.querySelector('.quality'))
-                    && bodyAfter.contains(badgeAfter()));
+    const chip = (key) => document.querySelector(`#camera-chips [data-camera="${key}"]`);
+    const recordingsFetches = () => window.__fetches.filter((u) => u.startsWith('api/recordings'));
+    async function search() {
+      const before = recordingsFetches().length;
+      document.getElementById('search-form').requestSubmit();
+      await until(() => recordingsFetches().length > before
+                        && !document.getElementById('search-button').disabled);
+      return recordingsFetches().slice(-1)[0] || '';
+    }
+    const iso = (h, m) => { const d = new Date(); d.setHours(h, m, 0, 0); return d.toISOString(); };
+    const clipAt = (id, key, name, kind, h, m) => ({
+      id, channel: key, camera_key: key, channel_name: name, camera_name: name, kind,
+      playback: kind === 'reolink' ? 'direct' : 'remux',
+      start: iso(h, m), end: iso(h, m + 2), duration_s: 120,
+      size_bytes: 4 * 1024 * 1024, has_sub: true,
+    });
+    // Newest first, exactly as the API sends them; two cameras interleaved in time.
+    const P1 = clipAt('p1', 'reolink-0', 'Porch', 'reolink', 10, 0);
+    const D2 = clipAt('d2', 'dvr-101', 'Driveway', 'dvr', 10, 10);
+    const P3 = clipAt('p3', 'reolink-0', 'Porch', 'reolink', 10, 20);
+    window.__recordings = { clips: [P3, D2, P1], truncated: false, truncated_cameras: [], errors: [] };
+    installFFmpeg({});
+    ffmpegPromise = null;
+    // Search the window that holds the fixture clips.
+    dateInput.value = localDate(new Date(P1.start));
+    fromInput.value = '09:30';
+    toInput.value = '11:00';
+
+    await until(() => chip('all'));
+    check('chips: All plus one per camera',
+          [...document.querySelectorAll('#camera-chips .chip')].map((c) => c.textContent).join(',')
+            === 'All,Driveway,Porch',
+          [...document.querySelectorAll('#camera-chips .chip')].map((c) => c.textContent).join(','));
+    check('chips: All is selected by default', chip('all').getAttribute('aria-pressed') === 'true');
+
+    let url = await search();
+    check('All -> camera=all', url.includes('camera=all') && !url.includes('camera=dvr'), url);
+
+    chip('reolink-0').click();
+    check('picking a camera unselects All',
+          chip('all').getAttribute('aria-pressed') === 'false'
+          && chip('reolink-0').getAttribute('aria-pressed') === 'true');
+    url = await search();
+    check('one camera -> camera=reolink-0 only',
+          url.includes('camera=reolink-0') && !url.includes('camera=all') && !url.includes('dvr-101'), url);
+    check('camera selection is persisted',
+          JSON.stringify(loadPref(STORE.cameras, null)) === '["reolink-0"]',
+          JSON.stringify(loadPref(STORE.cameras, null)));
+    chip('dvr-101').click();
+    check('picking every camera collapses back to All',
+          chip('all').getAttribute('aria-pressed') === 'true');
+    url = await search();
+    check('… and searches camera=all', url.includes('camera=all'), url);
+
+    // Timeline
+    const lanes = [...document.querySelectorAll('#timeline .tl-row:not(.tl-axis)')];
+    check('timeline: one lane per camera', lanes.length === 2, String(lanes.length));
+    check('timeline: every clip drawn as a segment',
+          document.querySelectorAll('#timeline .tl-seg').length === 3,
+          String(document.querySelectorAll('#timeline .tl-seg').length));
+    const porchLane = document.querySelector('#timeline .tl-row[data-camera="reolink-0"]');
+    check('timeline: segments sit in their camera lane',
+          porchLane && porchLane.querySelectorAll('.tl-seg').length === 2);
+    const segP1 = document.querySelector('#timeline .tl-seg[data-clip-id="p1"]');
+    const segP3 = document.querySelector('#timeline .tl-seg[data-clip-id="p3"]');
+    check('timeline: later clip is further right',
+          segP1 && segP3 && parseFloat(segP3.style.left) > parseFloat(segP1.style.left),
+          `${segP1 && segP1.style.left} vs ${segP3 && segP3.style.left}`);
+
+    // Tap a segment -> the single player opens on it.
+    const panel = document.getElementById('player-panel');
+    const pvideo = () => document.querySelector('#player-body video');
+    const pbadge = () => document.querySelector('#player-body .mode-badge');
+    const pdownload = () => document.querySelector('#player-body .download');
+    const playing = () => (current ? current.clip.id : null);
+    segP1.click();
+    await until(() => pbadge() && pbadge().dataset.mode && pbadge().dataset.mode !== 'working');
+    check('timeline tap opens the player panel', panel.hidden === false);
+    check('timeline tap plays that clip', playing() === 'p1', playing());
+    check('direct clip -> api/stream at sd, direct badge',
+          pvideo().getAttribute('src') === 'api/stream/p1?quality=sd' && pbadge().dataset.mode === 'direct',
+          `${pvideo().getAttribute('src')} ${pbadge().dataset.mode}`);
+    check('one player, none in the list or timeline',
+          document.querySelectorAll('#player-body video').length === 1
+          && !document.querySelector('#results video, #timeline video'));
+    check('playing clip is highlighted in timeline and list',
+          segP1.classList.contains('active')
+          && document.querySelector('#results [data-clip-id="p1"]').classList.contains('active'));
+
+    // Forward in time, across cameras — NOT list order (the list is newest-first).
+    const nextBtn = document.getElementById('next-clip');
+    const prevBtn = document.getElementById('prev-clip');
+    check('at the earliest clip, Earlier is disabled', prevBtn.disabled && !nextBtn.disabled);
+    nextBtn.click();
+    await until(() => pbadge() && pbadge().dataset.mode && pbadge().dataset.mode !== 'working');
+    check('Later goes to the next clip in time, on the other camera', playing() === 'd2', playing());
+    check('remux clip keeps the remux path', ['fast', 'compat'].includes(pbadge().dataset.mode),
+          pbadge().dataset.mode);
+    nextBtn.click();
+    await until(() => playing() === 'p3');
+    check('Later again -> latest clip', playing() === 'p3', playing());
+    check('at the latest clip, Later is disabled', nextBtn.disabled && !prevBtn.disabled);
+    prevBtn.click();
+    await until(() => playing() === 'd2');
+    check('Earlier goes back in time', playing() === 'd2', playing());
+
+    // Quality: switching updates Download and sticks for the next clip.
+    await until(() => pbadge().dataset.mode !== 'working');
+    [...document.querySelectorAll('#player-body .quality button')].find((b) => b.textContent === 'HD').click();
+    check('HD -> Download follows quality',
+          pdownload().getAttribute('href') === 'api/download/d2?quality=hd', pdownload().getAttribute('href'));
+    await until(() => pbadge().dataset.mode !== 'working');
+    nextBtn.click();
+    await until(() => playing() === 'p3');
+    check('chosen quality carries to the next clip',
+          pdownload().getAttribute('href') === 'api/download/p3?quality=hd'
+          && pvideo().getAttribute('src') === 'api/stream/p3?quality=hd',
+          `${pdownload().getAttribute('href')} ${pvideo().getAttribute('src')}`);
+    [...document.querySelectorAll('#player-body .quality button')].find((b) => b.textContent === 'SD').click();
+
+    // Autoplay-next
+    const autoplay = document.getElementById('autoplay');
+    autoplay.checked = false;
+    segP1.click();
+    pvideo().dispatchEvent(new Event('ended'));
+    await sleep(50);
+    check('autoplay off: clip end stays put', playing() === 'p1', playing());
+    autoplay.checked = true;
+    autoplay.dispatchEvent(new Event('change'));
+    pvideo().dispatchEvent(new Event('ended'));
+    await until(() => playing() === 'd2');
+    check('autoplay on: clip end plays the next later clip', playing() === 'd2', playing());
+    check('autoplay is persisted', loadPref(STORE.autoplay, null) === true);
+    autoplay.checked = false;
+    autoplay.dispatchEvent(new Event('change'));
+    await until(() => pbadge().dataset.mode !== 'working');
+
+    // Keyboard
+    const key = (target, k) => target.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    key(fromInput, 'k');
+    await sleep(30);
+    check('keyboard ignored while typing in a field', playing() === 'd2', playing());
+    key(document.body, 'k');
+    await until(() => playing() === 'p3');
+    check('k -> later clip', playing() === 'p3', playing());
+    key(document.body, 'j');
+    await until(() => playing() === 'd2');
+    check('j -> earlier clip', playing() === 'd2', playing());
+    await until(() => pbadge().dataset.mode !== 'working');
+
+    // A list row opens the same player.
+    document.querySelector('#results [data-clip-id="p3"] .clip-header').click();
+    await until(() => playing() === 'p3');
+    check('list row opens the clip in the player', playing() === 'p3', playing());
+    check('still one player, none in the list',
+          document.querySelectorAll('#player-body video').length === 1 && !document.querySelector('#results video'));
+
+    // Close
+    document.getElementById('player-close').click();
+    check('close hides the player', panel.hidden === true && current === null);
+
+    // Partial failure: per-camera banner, results still shown.
+    window.__recordings = {
+      clips: [P3, P1], truncated: true, truncated_cameras: ['reolink-0'],
+      errors: [{ camera: 'dvr-101', detail: "Can't reach the DVR." }],
+    };
+    await search();
+    const banners = [...document.querySelectorAll('#banners .banner')].map((b) => b.textContent);
+    check('per-camera error banner names the camera',
+          banners.length === 1 && banners[0].startsWith('Driveway:'), banners.join(' | '));
+    check('partial failure still lists the other camera',
+          document.querySelectorAll('#results .clip').length === 2);
+    check('truncation notice names the camera', /Porch.*limit/.test(message.textContent), message.textContent);
+
+    // Paging the list: 200 rows, then Show more; the timeline draws everything.
+    const many = [];
+    for (let i = 0; i < 250; i++) many.push(clipAt(`m${i}`, 'reolink-0', 'Porch', 'reolink', 10, 0));
+    window.__recordings = { clips: many, truncated: false, truncated_cameras: [], errors: [] };
+    await search();
+    const moreBtn = document.getElementById('show-more');
+    check('first 200 rows only', document.querySelectorAll('#results .clip').length === 200,
+          String(document.querySelectorAll('#results .clip').length));
+    check('Show more appears', moreBtn.hidden === false);
+    check('timeline draws all 250', document.querySelectorAll('#timeline .tl-seg').length === 250);
+    moreBtn.click();
+    check('Show more renders the rest', document.querySelectorAll('#results .clip').length === 250);
+    check('Show more hides when done', moreBtn.hidden === true);
   } catch (err) {
     check('harness ran without throwing', false, String(err && err.stack || err));
   }
