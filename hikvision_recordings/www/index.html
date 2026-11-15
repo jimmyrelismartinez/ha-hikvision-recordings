@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
   <!-- Belt and braces for Ingress: every relative URL resolves against this. -->
   <base href="./">
   <title>DVR Recordings</title>
@@ -15,9 +16,10 @@
   </header>
 
   <form id="search-form" class="controls">
-    <label>Camera
-      <select id="channel" required></select>
-    </label>
+    <div class="field-wide">
+      <span class="field-label" id="cameras-label">Cameras</span>
+      <div id="camera-chips" class="chips" role="group" aria-labelledby="cameras-label"></div>
+    </div>
     <label>Date
       <input type="date" id="date" required>
     </label>
@@ -36,8 +38,36 @@
     <button type="submit" class="primary" id="search-button">Search</button>
   </form>
 
-  <p id="message" class="message" hidden></p>
-  <ul id="results" class="results"></ul>
+  <main class="layout">
+    <!-- One player for the whole page. Sticky at the top on a phone, a side panel
+         on a wide screen. Rows and timeline segments open clips into it. -->
+    <section id="player-panel" class="player-panel" hidden aria-label="Player">
+      <div class="player-head">
+        <div class="player-title">
+          <span id="player-camera" class="player-camera"></span>
+          <span id="player-time" class="player-time"></span>
+        </div>
+        <button type="button" id="player-close" class="icon-button" aria-label="Close player" title="Close">✕</button>
+      </div>
+      <div id="player-body" class="player-body"></div>
+      <div class="player-nav">
+        <button type="button" id="prev-clip" class="nav-button" title="Earlier clip (j)">◀ Earlier</button>
+        <label class="toggle" title="When a clip ends, play the next later one">
+          <input type="checkbox" id="autoplay"> Autoplay next
+        </label>
+        <button type="button" id="next-clip" class="nav-button" title="Later clip (k)">Later ▶</button>
+      </div>
+      <p class="keys-hint">Space play/pause · ←/→ 5 s · j/k earlier/later · f fullscreen</p>
+    </section>
+
+    <section class="browse">
+      <div id="banners" class="banners"></div>
+      <p id="message" class="message" hidden></p>
+      <div id="timeline" class="timeline" hidden></div>
+      <ul id="results" class="results"></ul>
+      <button type="button" id="show-more" class="show-more" hidden>Show more</button>
+    </section>
+  </main>
 
   <!-- ffmpeg.wasm, vendored into the image at build time (see Dockerfile) — never
        a CDN, so playback never needs outbound internet from the container.

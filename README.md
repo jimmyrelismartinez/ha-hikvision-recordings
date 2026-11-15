@@ -23,6 +23,23 @@ your browser.
 
 ## Notes
 
+### Browsing and playback (v0.3.0)
+
+- **Cameras:** "All" plus one chip per camera. Pick any mix; picking every camera
+  collapses back to "All", so a camera added later is included automatically. The
+  choice is remembered on that device.
+- **Timeline:** one lane per camera over the searched window, with a red "now" marker
+  on today. Tap a segment to play it. Every clip is drawn; the list below shows the
+  first 200 and a **Show more** button.
+- **One player:** pinned to the top on a phone, a side panel on a wide screen.
+  **Earlier / Later** and **Autoplay next** go **forward in time across all cameras**,
+  not in list order (the list is newest-first). SD/HD carries over from clip to clip,
+  and **Download** follows it.
+- **Keyboard** (ignored while typing in a field): Space play/pause, ←/→ seek 5 s,
+  `j`/`k` earlier/later clip, `f` fullscreen (iOS uses the native video fullscreen).
+- If one camera fails, its error shows as a banner and the other cameras' clips still
+  list. Light and dark themes follow the device setting.
+
 ### Reolink cameras (v0.2.0)
 
 Standalone Reolink cameras that record to their **own SD card** are supported next to

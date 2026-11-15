@@ -26,6 +26,9 @@ REPO = Path(__file__).resolve().parent.parent.parent
 PAGE = "/tests/frontend/test_fallback.html"
 CHROME_CANDIDATES = (
     "/opt/google/chrome/chrome",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
     "google-chrome",
     "chromium",
     "chromium-browser",
