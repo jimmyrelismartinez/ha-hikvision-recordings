@@ -64,6 +64,22 @@ class RangeNotSatisfiable(DvrError):
         self.content_range = content_range
 
 
+# Hikvision metadataDescriptor tail → closed event vocabulary (design §3.4).
+_HIK_EVENT_MAP = {
+    "motion": "motion",
+    "vmd": "motion",
+    "pir": "motion",
+    "cmr": "scheduled",
+    "timing": "scheduled",
+    "continuous": "scheduled",
+    "alarm": "alarm",
+    "alarminput": "alarm",
+}
+_HIK_EVENT_ORDER = (
+    "motion", "person", "vehicle", "animal", "face", "doorbell", "scheduled", "alarm",
+)
+
+
 @dataclass(frozen=True)
 class Recording:
     channel: int
@@ -71,10 +87,26 @@ class Recording:
     end: datetime            # tz-aware, UTC
     size_bytes: int
     playback_uri: str        # opaque token from the DVR — NOT a URL we connect to
+    events: tuple[str, ...] = ()
 
     @property
     def duration_s(self) -> int:
         return int((self.end - self.start).total_seconds())
+
+
+def _events_from_match_item(item: ET.Element) -> tuple[str, ...]:
+    """Read metadataMatches/metadataDescriptor tails into the closed vocabulary."""
+    found: set[str] = set()
+    for child in item.iter():
+        if _local(child.tag) != "metadataDescriptor" or not child.text:
+            continue
+        tail = child.text.strip().rsplit("/", 1)[-1].lower()
+        mapped = _HIK_EVENT_MAP.get(tail)
+        if mapped is None:
+            LOG.debug("ignoring unknown Hikvision metadataDescriptor %r", child.text.strip())
+            continue
+        found.add(mapped)
+    return tuple(e for e in _HIK_EVENT_ORDER if e in found)
 
 
 def build_search_body(
@@ -178,6 +210,7 @@ def parse_search_response(
                 end=to_utc(_parse_dvr_time(end_raw)),
                 size_bytes=_size_from_uri(uri),
                 playback_uri=uri,
+                events=_events_from_match_item(item),
             )
         )
     return recordings
