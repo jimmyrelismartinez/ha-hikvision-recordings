@@ -54,6 +54,23 @@ reolink_cameras:
 `/api/channels` reports `"snapshot": true` only when the camera is linked **and**
 the Supervisor token is present. `/api/health` reports `"ha_api": "ok"|"off"`.
 
+### Camera views (v0.5.0)
+
+- **Home (`#/`):** a horizontally scrolling Recent strip (newest 12 clips across all
+  cameras in the last 6 hours) and a tile per camera. Linked cameras (`ha_camera`)
+  show a near-live HA snapshot; others use the newest clip thumbnail. Snapshot
+  refresh is scheduled after each load (home 60 s, camera page 5 s), pauses when the
+  tab is hidden or after 2 minutes idle, and resumes on tap.
+- **Camera page (`#/camera/<key>`):** the shared player stage shows the live snapshot
+  (or latest thumbnail) until a clip plays; **● Live** returns to the snapshot. Below
+  it, a simplified vertical timeline (fixed-height rows, gap bands ≥ 2 min, no hour
+  ticks / tap-to-seek) loads Today then older days on scroll (stops after 7 empty days
+  or 30 days back). Event-type filter chips appear only when more than one type is
+  present; Earlier/Later/Autoplay skip filtered clips.
+- **All recordings (`#/all`):** the v0.3.0 search UI, unchanged in behaviour.
+- Hash routes only (Ingress-safe). One `<video>` for the whole app; `#player-panel` is
+  never re-parented.
+
 ### Browsing and playback (v0.3.0)
 
 - **Cameras:** "All" plus one chip per camera. Pick any mix; picking every camera
