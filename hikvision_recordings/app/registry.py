@@ -7,6 +7,10 @@ this process minted from a real search result. Nothing here touches disk.
 Every ref is re-validated by the rules of the device family that produced it:
 a Hikvision playbackURI must point at the configured DVR, a Reolink ref must be a
 file name of the exact shape that camera's SD card uses.
+
+A secondary index (kind, camera_key, start, main_ref) reuses the id when the same
+clip is listed again (infinite scroll must not mint a fresh id and FIFO-evict
+Today's clips).
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from .reolink import InvalidReolinkRef, validate_reolink_ref
 LOG = logging.getLogger(__name__)
 
 DEFAULT_TTL_S = 3600.0
-DEFAULT_CAPACITY = 500
+DEFAULT_CAPACITY = 2000
 
 
 class ClipExpired(KeyError):
@@ -42,6 +46,10 @@ class _Entry:
     expires_at: float
 
 
+def _identity(clip: Clip) -> tuple:
+    return (clip.kind, clip.camera_key, clip.start, clip.main_ref)
+
+
 class ClipRegistry:
     def __init__(
         self,
@@ -50,6 +58,7 @@ class ClipRegistry:
         capacity: int = DEFAULT_CAPACITY,
     ) -> None:
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
+        self._by_identity: dict[tuple, str] = {}
         self._ttl_s = ttl_s
         self._capacity = capacity
         self._dvr_host = dvr_host
@@ -118,10 +127,21 @@ class ClipRegistry:
                 LOG.warning("dropping an invalid substream ref; using the mainstream")
                 clip = clip.with_sub(None, None)
         self._purge()
+        identity = _identity(clip)
+        existing_id = self._by_identity.get(identity)
+        if existing_id is not None and existing_id in self._entries:
+            # Same clip again (e.g. infinite-scroll re-list): reuse the id,
+            # refresh TTL, move to MRU end, update the Clip (newly paired sub).
+            self._entries[existing_id] = _Entry(clip, time.monotonic() + self._ttl_s)
+            self._entries.move_to_end(existing_id)
+            return existing_id
+
         clip_id = secrets.token_urlsafe(12)
         self._entries[clip_id] = _Entry(clip, time.monotonic() + self._ttl_s)
+        self._by_identity[identity] = clip_id
         while len(self._entries) > self._capacity:
-            self._entries.popitem(last=False)
+            evicted_id, evicted = self._entries.popitem(last=False)
+            self._by_identity.pop(_identity(evicted.clip), None)
         return clip_id
 
     def get(self, clip_id: str) -> Clip:
@@ -130,10 +150,13 @@ class ClipRegistry:
             raise ClipExpired(clip_id)
         if entry.expires_at <= time.monotonic():
             self._entries.pop(clip_id, None)
+            self._by_identity.pop(_identity(entry.clip), None)
             raise ClipExpired(clip_id)
         return entry.clip
 
     def _purge(self) -> None:
         now = time.monotonic()
         for clip_id in [k for k, v in self._entries.items() if v.expires_at <= now]:
-            self._entries.pop(clip_id, None)
+            entry = self._entries.pop(clip_id, None)
+            if entry is not None:
+                self._by_identity.pop(_identity(entry.clip), None)
