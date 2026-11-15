@@ -13,15 +13,46 @@ your browser.
 3. Install **DVR Recordings**, open Configuration, fill in:
    - `dvr_host` — DVR IP (e.g. `10.10.11.56`). Must match the IP/hostname the DVR reports in its own playback URIs. For Hikvision, this is typically the DVR's IP address, not a hostname.
    - `dvr_username` / `dvr_password` — a DVR account with playback rights
-   - `channels` — one row per camera: `id` (e.g. `101`) and `name` (e.g. `Driveway`)
+   - `channels` — one row per camera: `id` (e.g. `101`) and `name` (e.g. `Driveway`);
+     optional `ha_camera` (e.g. `camera.driveway`) to link a Home Assistant camera
+     entity for near-live snapshots
    - `reolink_cameras` — optional, one row per standalone Reolink camera (see below).
-     The `dvr_*` fields may be left blank if you only have Reolink cameras.
+     The `dvr_*` fields may be left blank if you only have Reolink cameras. Each row
+     may also set optional `ha_camera`.
 4. Start. The panel appears in the sidebar as **Recordings**.
 
 > Add-on options are stored by Supervisor in `/data/options.json` in plaintext — standard
 > for every HA add-on. Use a limited playback/operator DVR account, not `admin`.
 
+> **Home Assistant API (v0.4.0):** the add-on declares `homeassistant_api: true` so
+> Supervisor injects a short-lived `SUPERVISOR_TOKEN`. That token is used only for
+> `GET /api/snapshot/<camera_key>` (HA's `camera_proxy`) when a camera row has
+> `ha_camera` set. It never leaves the add-on and is stripped from the process
+> environment at startup so ffmpeg subprocesses cannot inherit it. Leave
+> `ha_camera` blank to skip snapshots for that camera.
+
 ## Notes
+
+### Home Assistant snapshots (v0.4.0)
+
+Link a channel or Reolink row to an existing HA camera entity:
+
+```yaml
+channels:
+  - id: 101
+    name: Driveway
+    ha_camera: camera.driveway   # optional
+reolink_cameras:
+  - name: Porch
+    host: 192.0.2.40
+    username: viewer
+    password: "..."
+    ha_camera: camera.porch      # optional
+```
+
+`GET api/snapshot/<camera_key>` returns a JPEG/PNG with `Cache-Control: no-store`.
+`/api/channels` reports `"snapshot": true` only when the camera is linked **and**
+the Supervisor token is present. `/api/health` reports `"ha_api": "ok"|"off"`.
 
 ### Browsing and playback (v0.3.0)
 

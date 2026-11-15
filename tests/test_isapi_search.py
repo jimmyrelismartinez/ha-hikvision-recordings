@@ -58,3 +58,52 @@ def test_parse_bad_xml_content_raises_with_uuid_hint(bad_xml_content):
         parse_search_response(bad_xml_content, channel=101, to_utc=IDENTITY)
     message = str(exc.value)
     assert "searchID" in message and "uuid" in message.lower()
+
+
+SEARCH_WITH_EVENTS = """<?xml version="1.0" encoding="UTF-8"?>
+<CMSearchResult xmlns="http://www.hikvision.com/ver20/XMLSchema">
+<responseStatus>true</responseStatus>
+<responseStatusStrg>OK</responseStatusStrg>
+<numOfMatches>2</numOfMatches>
+<matchList>
+<searchMatchItem>
+<trackID>101</trackID>
+<timeSpan><startTime>2026-07-24T13:20:29Z</startTime><endTime>2026-07-24T13:21:42Z</endTime></timeSpan>
+<mediaSegmentDescriptor>
+<playbackURI>rtsp://192.0.2.10/Streaming/tracks/101/?starttime=20260724T132029Z&amp;size=100</playbackURI>
+</mediaSegmentDescriptor>
+<metadataMatches>
+<metadataDescriptor>recordType.meta.std-cgi.com/motion</metadataDescriptor>
+</metadataMatches>
+</searchMatchItem>
+<searchMatchItem>
+<trackID>101</trackID>
+<timeSpan><startTime>2026-07-24T13:25:00Z</startTime><endTime>2026-07-24T13:26:00Z</endTime></timeSpan>
+<mediaSegmentDescriptor>
+<playbackURI>rtsp://192.0.2.10/Streaming/tracks/101/?starttime=20260724T132500Z&amp;size=200</playbackURI>
+</mediaSegmentDescriptor>
+<metadataMatches>
+<metadataDescriptor>recordType.meta.std-cgi.com/CMR</metadataDescriptor>
+<metadataDescriptor>recordType.meta.std-cgi.com/unknownThing</metadataDescriptor>
+</metadataMatches>
+</searchMatchItem>
+</matchList>
+</CMSearchResult>"""
+
+
+def test_parse_reads_metadata_matches_into_events():
+    recs = parse_search_response(SEARCH_WITH_EVENTS, channel=101, to_utc=IDENTITY)
+    assert recs[0].events == ("motion",)
+    assert recs[1].events == ("scheduled",)
+
+
+def test_parse_without_metadata_defaults_to_empty_events(search_ok):
+    recs = parse_search_response(search_ok, channel=101, to_utc=IDENTITY)
+    assert all(r.events == () for r in recs)
+
+
+def test_search_body_still_has_no_metadata_list():
+    """Do not send metadataList — firmware rejects some descriptors (design §2)."""
+    body = build_search_body(101, "2026-07-24T13:00:00Z", "2026-07-24T14:00:00Z", 40)
+    assert "metadataList" not in body
+    assert "metadataDescriptor" not in body

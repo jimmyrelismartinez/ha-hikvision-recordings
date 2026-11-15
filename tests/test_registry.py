@@ -47,12 +47,47 @@ def test_entries_expire():
 
 def test_capacity_evicts_oldest():
     reg = ClipRegistry(dvr_host="10.10.11.56", capacity=2)
-    first = reg.put(make_recording())
-    reg.put(make_recording())
-    reg.put(make_recording())
+    first = reg.put(make_recording(
+        "rtsp://10.10.11.56/Streaming/tracks/101/?starttime=1&size=1"))
+    reg.put(make_recording(
+        "rtsp://10.10.11.56/Streaming/tracks/101/?starttime=2&size=2"))
+    reg.put(make_recording(
+        "rtsp://10.10.11.56/Streaming/tracks/101/?starttime=3&size=3"))
     assert len(reg) == 2
     with pytest.raises(ClipExpired):
         reg.get(first)
+
+
+def test_same_clip_twice_reuses_id_and_refreshes_ttl():
+    """Infinite-scroll re-list must not mint a fresh id (design §10.1)."""
+    reg = ClipRegistry(dvr_host="10.10.11.56", ttl_s=60.0)
+    clip = make_recording()
+    first = reg.put(clip)
+    # Advance "time" by patching the stored expiry into the past-ish future,
+    # then put again and confirm the id is reused and the entry is still live.
+    entry = reg._entries[first]
+    entry.expires_at = entry.expires_at - 30.0
+    before = entry.expires_at
+    second = reg.put(clip.with_sub(
+        "rtsp://10.10.11.56/Streaming/tracks/102/?starttime=1&size=2", 100))
+    assert second == first
+    assert len(reg) == 1
+    updated = reg.get(first)
+    assert updated.sub_ref is not None
+    assert reg._entries[first].expires_at > before
+
+
+def test_eviction_removes_identity_index():
+    reg = ClipRegistry(dvr_host="10.10.11.56", capacity=1)
+    a = make_recording("rtsp://10.10.11.56/Streaming/tracks/101/?starttime=1&size=1")
+    b = make_recording("rtsp://10.10.11.56/Streaming/tracks/101/?starttime=2&size=2")
+    first = reg.put(a)
+    reg.put(b)
+    with pytest.raises(ClipExpired):
+        reg.get(first)
+    # Re-putting A after eviction must mint a NEW id (index entry was cleared).
+    again = reg.put(a)
+    assert again != first
 
 
 def test_foreign_host_uri_is_rejected():

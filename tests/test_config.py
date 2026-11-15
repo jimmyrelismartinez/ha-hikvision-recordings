@@ -142,3 +142,48 @@ def test_reolink_row_requires_its_fields(missing):
 def test_configured_dvr_still_requires_credentials_with_reolink_present():
     with pytest.raises(ConfigError, match="dvr_password"):
         load_config({**VALID, "dvr_password": "", "reolink_cameras": [REOLINK]})
+
+
+# ── v0.4.0: ha_camera ─────────────────────────────────────────────────────────
+
+def test_ha_camera_accepted_on_channel_and_reolink():
+    cfg = load_config({
+        **VALID,
+        "channels": [{"id": 101, "name": "Driveway", "ha_camera": "camera.driveway"}],
+        "reolink_cameras": [{**REOLINK, "ha_camera": "camera.porch"}],
+    })
+    assert cfg.channels[0].ha_camera == "camera.driveway"
+    assert cfg.reolink_cameras[0].ha_camera == "camera.porch"
+
+
+def test_ha_camera_empty_string_is_absent():
+    cfg = load_config({
+        **VALID,
+        "channels": [{"id": 101, "name": "Garden", "ha_camera": ""}],
+    })
+    assert cfg.channels[0].ha_camera is None
+
+
+@pytest.mark.parametrize("bad", [
+    "camera.x\n",
+    "camera.x/../states",
+    "light.x",
+    "Camera.porch",
+    "camera.UPPER",
+    "camera.",
+    "camera.this_name_is_way_too_long_for_the_sixty_four_char_limit_abcdefghijk",
+])
+def test_ha_camera_rejects_hostile_values(bad):
+    with pytest.raises(ConfigError, match=r"channels\[0\]\.ha_camera"):
+        load_config({
+            **VALID,
+            "channels": [{"id": 101, "name": "Porch", "ha_camera": bad}],
+        })
+
+
+def test_ha_camera_reject_names_the_reolink_row():
+    with pytest.raises(ConfigError, match=r"reolink_cameras\[0\]\.ha_camera"):
+        load_config({
+            **VALID,
+            "reolink_cameras": [{**REOLINK, "ha_camera": "light.porch"}],
+        })
