@@ -147,7 +147,7 @@ body.view-camera #stage-slot { display: none; }
   padding: 0.6rem 0.8rem; background: var(--bad-bg); color: var(--bad); border-radius: 8px;
 }
 .vrow {
-  display: grid; grid-template-columns: 4.5rem 14px minmax(0, 1fr);
+  display: grid; grid-template-columns: 4rem 14px minmax(0, 1fr);
   gap: 0.5rem; align-items: stretch; min-height: 72px;
 }
 .vrow.dimmed .vrow-seg { opacity: 0.25; }
@@ -173,10 +173,15 @@ body.view-camera #stage-slot { display: none; }
 }
 .vrow-card-body { flex: 1; min-width: 0; padding: 0.5rem 0.65rem; }
 .vrow-card-time { font-weight: 600; font-size: 0.9rem; }
+.vrow-card-duration { color: var(--muted); font-size: 0.8rem; margin-bottom: 0.3rem; font-variant-numeric: tabular-nums; }
+@media (max-width: 719px) {
+  .vrow-card .clip-thumb { width: 96px; }
+  .vrow-card-body { padding: 0.45rem 0.5rem; }
+}
 .vrow.active .vrow-card { border-color: var(--seg-active); }
 .vgap {
   height: 28px; display: flex; align-items: center; justify-content: center;
-  color: var(--muted); font-size: 0.75rem; margin: 0.15rem 0 0.15rem 5.2rem;
+  color: var(--muted); font-size: 0.75rem; margin: 0.15rem 0 0.15rem 4.7rem;
 }
 .day-sentinel { height: 1px; }
 
@@ -455,7 +460,8 @@ body.view-all .player-panel { margin-top: 1rem; }
    and a shorter video so the pinned player leaves room to scroll. */
 @media (max-width: 719px) {
   .clip { display: flex; align-items: stretch; }
-  .clip-thumb { flex: none; width: 120px; border-bottom: 0; border-right: 1px solid var(--border); }
+  /* Only the #/all list rows: tiles and Recent cards keep a full-width image. */
+  .clip .clip-thumb { flex: none; width: 120px; border-bottom: 0; border-right: 1px solid var(--border); }
   .clip-header { flex: 1; min-width: 0; }
   .player-body video { max-height: 28vh; }
   .player-panel { padding: 0.5rem 0.6rem; }
