@@ -220,7 +220,7 @@ def test_health_reports_ha_api_off_without_token():
     with client_for(FakeClient()) as client:
         body = client.get("/api/health").json()
     assert body["ha_api"] == "off"
-    assert body["version"] == "0.4.0"
+    assert body["version"] == "0.5.0"
 
 
 def test_recordings_include_events_list():
