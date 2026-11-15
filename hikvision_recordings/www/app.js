@@ -37,6 +37,7 @@ const cameraTitle = $('camera-title');
 const liveButton = $('live-button');
 const dateChip = $('date-chip');
 const dateJump = $('date-jump');
+const backToTodayBtn = $('back-to-today');
 const eventFiltersEl = $('event-filters');
 const vtimelineEl = $('vtimeline');
 const daySentinel = $('day-sentinel');
@@ -49,6 +50,7 @@ const stageLabel = $('stage-label');
 const stagePaused = $('stage-paused');
 const tabCameras = $('tab-cameras');
 const tabAll = $('tab-all');
+const timelineSticky = document.querySelector('.timeline-sticky');
 
 const pad = (n) => String(n).padStart(2, '0');
 const localDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -71,6 +73,7 @@ const MAX_THUMB_INFLIGHT = 2;
 const GAP_BAND_MIN_S = 120;
 const EMPTY_DAY_STOP = 7;
 const MAX_DAYS_BACK = 30;
+const REFRESH_DAY_CACHE_MS = 60 * 1000;
 
 /* ── Persisted preferences ─────────────────────────────────────────────────── */
 const STORE = {
@@ -235,6 +238,26 @@ async function loadChannels() {
   renderChips();
 }
 
+function applyHealthDots() {
+  if (!cameraTiles) return;
+  for (const tile of cameraTiles.querySelectorAll('.camera-tile')) {
+    const key = tile.dataset.camera;
+    const foot = tile.querySelector('.tile-foot');
+    if (!foot || !key) continue;
+    const existing = foot.querySelector('.tile-error');
+    if (deviceDown(key)) {
+      if (!existing) {
+        const dot = document.createElement('span');
+        dot.className = 'tile-error';
+        dot.title = 'Device unreachable';
+        foot.appendChild(dot);
+      }
+    } else if (existing) {
+      existing.remove();
+    }
+  }
+}
+
 async function loadHealth() {
   try {
     const health = await (await fetch('api/health')).json();
@@ -255,6 +278,7 @@ async function loadHealth() {
     if (typeof health.client_remux_max_mb === 'number' && health.client_remux_max_mb > 0) {
       CLIENT_REMUX_MAX_BYTES = health.client_remux_max_mb * 1024 * 1024;
     }
+    applyHealthDots();
   } catch (err) {
     statusEl.textContent = '';
   }
@@ -308,7 +332,16 @@ function dropThumbIfQueued(img) {
   }
 }
 
-async function fetchThumbInto(img) {
+function revokeImgObjectUrl(img) {
+  if (!img) return;
+  const prev = img.dataset.objectUrl;
+  if (prev) {
+    URL.revokeObjectURL(prev);
+    delete img.dataset.objectUrl;
+  }
+}
+
+async function fetchThumbInto(img, { force = false } = {}) {
   const url = img.dataset.src;
   if (!url) return;
   try {
@@ -322,15 +355,21 @@ async function fetchThumbInto(img) {
     }
     if (!response.ok) throw new Error('thumb failed');
     const blob = await response.blob();
-    if (img.dataset.loaded === '1') return;
+    if (!force && img.dataset.loaded === '1') return;
+    revokeImgObjectUrl(img);
     const objectUrl = URL.createObjectURL(blob);
+    img.dataset.objectUrl = objectUrl;
     img.onload = () => {
       img.parentElement && img.parentElement.classList.add('loaded');
-      URL.revokeObjectURL(objectUrl);
+    };
+    img.onerror = () => {
+      revokeImgObjectUrl(img);
+      img.parentElement && img.parentElement.classList.add('failed');
     };
     img.src = objectUrl;
     img.dataset.loaded = '1';
   } catch (err) {
+    revokeImgObjectUrl(img);
     img.parentElement && img.parentElement.classList.add('failed');
   }
 }
@@ -472,34 +511,102 @@ function setMode(badge, mode, detail) {
   badge.title = detail || '';
 }
 
-/* ── 410 retry by clipKey ─────────────────────────────────────────────────── */
+/* ── 410 retry by clipKey (single-flight + 60s cache per camera/day) ─────── */
+const refreshDayCache = new Map(); // `${camera}|${day}` -> { at, clips?, promise? }
+
+function applyRefreshedClips(cameraKey, clips) {
+  const byKey = new Map();
+  for (const c of clips) byKey.set(clipKey(c), c);
+  if (camState.key === cameraKey) {
+    for (const day of camState.days) {
+      for (let i = 0; i < day.clips.length; i++) {
+        const fresh = byKey.get(clipKey(day.clips[i]));
+        if (fresh) day.clips[i] = fresh;
+      }
+    }
+    rebuildCamClips();
+  }
+  for (const clip of recentClips) {
+    const fresh = byKey.get(clipKey(clip));
+    if (fresh) Object.assign(clip, fresh);
+  }
+  for (const [k, clip] of recentByCamera) {
+    const fresh = byKey.get(clipKey(clip));
+    if (fresh) recentByCamera.set(k, fresh);
+  }
+  for (const img of document.querySelectorAll('img[data-refresh-key]')) {
+    const fresh = byKey.get(img.dataset.refreshKey);
+    if (fresh) img.dataset.src = `api/thumbnail/${fresh.id}`;
+  }
+  for (const row of document.querySelectorAll('[data-clip-key][data-clip-id]')) {
+    const fresh = byKey.get(row.dataset.clipKey);
+    if (fresh) row.dataset.clipId = fresh.id;
+  }
+  return byKey;
+}
+
 async function refreshClipByKey(key) {
   const [cameraKey, startMs] = String(key).split('|');
   const start = new Date(Number(startMs));
   if (!cameraKey || !Number.isFinite(start.getTime())) return null;
+  const dayStr = localDate(start);
+  const cacheKey = `${cameraKey}|${dayStr}`;
+  const cached = refreshDayCache.get(cacheKey);
+  if (cached) {
+    if (cached.promise) {
+      try {
+        const clips = await cached.promise;
+        return clips.find((c) => clipKey(c) === key) || null;
+      } catch (err) {
+        return null;
+      }
+    }
+    if (cached.clips && Date.now() - cached.at < REFRESH_DAY_CACHE_MS) {
+      return cached.clips.find((c) => clipKey(c) === key) || null;
+    }
+  }
   const day0 = startOfLocalDay(start);
   const day1 = endOfLocalDay(start);
-  try {
+  const promise = (async () => {
     const params = new URLSearchParams({
       camera: cameraKey,
       start: day0.toISOString(),
       end: day1.toISOString(),
     });
     const response = await fetch(`api/recordings?${params}`);
-    if (!response.ok) return null;
+    if (!response.ok) throw new Error('refresh failed');
     const body = await response.json();
-    const found = (body.clips || []).find((c) => clipKey(c) === key);
-    if (found && camState.key === cameraKey) {
-      // Update in-memory day lists so Later/Earlier keep working.
-      for (const day of camState.days) {
-        const i = day.clips.findIndex((c) => clipKey(c) === key);
-        if (i >= 0) day.clips[i] = found;
-      }
-      rebuildCamClips();
-    }
-    return found || null;
+    return body.clips || [];
+  })();
+  refreshDayCache.set(cacheKey, { at: Date.now(), promise });
+  try {
+    const clips = await promise;
+    applyRefreshedClips(cameraKey, clips);
+    refreshDayCache.set(cacheKey, { at: Date.now(), clips });
+    return clips.find((c) => clipKey(c) === key) || null;
   } catch (err) {
+    refreshDayCache.delete(cacheKey);
     return null;
+  }
+}
+
+async function probeGone(url) {
+  try {
+    // Keep relative when possible (ingress prefix); strip origin if a property gave us absolute.
+    let rel = String(url);
+    try {
+      const abs = new URL(rel, window.location.href);
+      if (abs.origin === window.location.origin) {
+        rel = abs.pathname.replace(/^\//, '') + abs.search;
+        // Drop any leading ingress-unrelated absolute path down to api/...
+        const apiAt = rel.indexOf('api/');
+        if (apiAt >= 0) rel = rel.slice(apiAt);
+      }
+    } catch (err) { /* keep rel */ }
+    const response = await fetch(rel, { headers: { Range: 'bytes=0-0' } });
+    return response.status === 410;
+  } catch (err) {
+    return false;
   }
 }
 
@@ -569,9 +676,28 @@ function buildPlayer(clip, body, opts = {}) {
   }
   updateDownload();
 
-  // 410 on download click: refresh once by clipKey.
+  // 410 on download click: probe, refresh id once, then navigate.
   download.addEventListener('click', async (ev) => {
-    // Let the browser navigate for the happy path; only intercept after a prior hint.
+    ev.preventDefault();
+    const go = (href) => {
+      if (typeof window.__downloadNavigate === 'function') window.__downloadNavigate(href);
+      else window.location.assign(href);
+    };
+    // Prefer the relative attribute — download.href is absolute and breaks ingress-relative fetches.
+    const href = download.getAttribute('href') || download.href;
+    if (await probeGone(href)) {
+      const fresh = await refreshClipByKey(clipKey(activeClip));
+      if (!fresh) {
+        hint.textContent = 'This clip is no longer available — refresh';
+        return;
+      }
+      activeClip = fresh;
+      if (current && clipKey(current.clip) === clipKey(fresh)) current.clip = fresh;
+      updateDownload();
+      go(download.getAttribute('href') || download.href);
+      return;
+    }
+    go(href);
   });
 
   bar.append(download);
@@ -586,10 +712,21 @@ function buildPlayer(clip, body, opts = {}) {
     if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
   }
 
-  function useServerPath(reason) {
+  function useServerPath(reason, mine) {
     setMode(badge, 'compat', reason);
     hint.textContent = "Seeking isn't supported on this path — download the clip to scrub.";
-    video.src = `api/stream/${activeClip.id}?quality=${quality}`;
+    const src = `api/stream/${activeClip.id}?quality=${quality}`;
+    video.onerror = async () => {
+      video.onerror = null;
+      if (mine !== undefined && mine !== generation) return;
+      if (!(await probeGone(src))) return;
+      if (mine !== undefined && mine !== generation) return;
+      if (await handle410()) {
+        if (mine !== undefined && mine !== generation) return;
+        play();
+      }
+    };
+    video.src = src;
     video.play().catch(() => {});
   }
 
@@ -627,10 +764,14 @@ function buildPlayer(clip, body, opts = {}) {
       hint.textContent = '';
       const src = `api/stream/${activeClip.id}?quality=${q}`;
       video.onerror = async () => {
-        // Best-effort 410 detection via a HEAD-less re-fetch probe is heavy;
-        // stream errors after a registry eviction surface as play failure — retry once.
         video.onerror = null;
-        if (await handle410()) play();
+        if (mine !== generation) return;
+        if (!(await probeGone(src))) return;
+        if (mine !== generation) return;
+        if (await handle410()) {
+          if (mine !== generation) return;
+          play();
+        }
       };
       video.src = src;
       video.play().catch(() => {});
@@ -639,7 +780,7 @@ function buildPlayer(clip, body, opts = {}) {
 
     const blocker = clientRemuxBlocker(activeClip);
     if (blocker) {
-      useServerPath(blocker);
+      useServerPath(blocker, mine);
       return;
     }
 
@@ -661,13 +802,14 @@ function buildPlayer(clip, body, opts = {}) {
       if (mine !== generation) return;
       if (err && err.status === 410) {
         if (await handle410()) {
+          if (mine !== generation) return;
           play();
           return;
         }
         return;
       }
       console.warn('client remux failed; using the server path', err);
-      useServerPath(`client remux failed: ${err && err.message ? err.message : err}`);
+      useServerPath(`client remux failed: ${err && err.message ? err.message : err}`, mine);
     }
   }
 
@@ -1128,6 +1270,8 @@ document.addEventListener('keydown', handleKey);
 const snapState = {
   timer: null,
   paused: false,
+  running: false,
+  pausedForHidden: false,
   fails: new Map(),     // cameraKey -> consecutive failures
   lastUrl: new Map(),   // cameraKey -> object URL or src
 };
@@ -1146,18 +1290,30 @@ function clearSnapTimer() {
 function pauseSnapshots(reason) {
   clearSnapTimer();
   snapState.paused = true;
-  if (stagePaused) {
-    stagePaused.hidden = false;
-    stagePaused.textContent = 'Paused · tap to resume';
+  snapState.pausedForHidden = reason === 'hidden';
+  if (stagePaused && route.name === 'camera') {
+    const cam = cameras.find((c) => c.key === route.key);
+    if (cam && cam.snapshot) {
+      stagePaused.hidden = false;
+      stagePaused.textContent = 'Paused · tap to resume';
+    }
   }
-  document.querySelectorAll('.tile-paused').forEach((el) => { el.hidden = false; });
+  // Overlay only on tiles that have HA snapshots.
+  document.querySelectorAll('.camera-tile').forEach((tile) => {
+    const cam = cameras.find((c) => c.key === tile.dataset.camera);
+    const el = tile.querySelector('.tile-paused');
+    if (!el) return;
+    el.hidden = !(cam && cam.snapshot);
+  });
 }
 
 function resumeSnapshots() {
   snapState.paused = false;
+  snapState.pausedForHidden = false;
   if (stagePaused) stagePaused.hidden = true;
   document.querySelectorAll('.tile-paused').forEach((el) => { el.hidden = true; });
-  scheduleSnapshots();
+  clearSnapTimer();
+  runSnapshotCycle();
 }
 
 function scheduleSnapshots() {
@@ -1165,7 +1321,7 @@ function scheduleSnapshots() {
   if (snapState.paused) return;
   if (!snapshotsAllowed()) {
     if (document.visibilityState !== 'visible' || Date.now() - lastInteraction > IDLE_MS) {
-      pauseSnapshots();
+      pauseSnapshots(document.visibilityState !== 'visible' ? 'hidden' : 'idle');
     }
     return;
   }
@@ -1191,32 +1347,45 @@ async function loadSnapshot(cameraKey) {
 
 async function runSnapshotCycle() {
   snapState.timer = null;
+  if (snapState.running) return;
   if (!snapshotsAllowed()) {
-    pauseSnapshots();
+    pauseSnapshots(document.visibilityState !== 'visible' ? 'hidden' : 'idle');
     return;
   }
+  snapState.running = true;
+  const routeKey = route.key;
+  const routeName = route.name;
   try {
-    if (route.name === 'home') {
+    if (routeName === 'home') {
       const linked = cameras.filter((c) => c.snapshot);
       await Promise.all(linked.map(async (cam) => {
         const url = await loadSnapshot(cam.key);
+        if (route.name !== 'home') {
+          if (url) URL.revokeObjectURL(url);
+          return;
+        }
         if (url) applyTileSnapshot(cam.key, url);
         else if ((snapState.fails.get(cam.key) || 0) >= 2) fallbackTileThumb(cam.key);
       }));
-    } else if (route.name === 'camera' && route.key && !current) {
-      const cam = cameras.find((c) => c.key === route.key);
+    } else if (routeName === 'camera' && routeKey && !current) {
+      const cam = cameras.find((c) => c.key === routeKey);
       if (cam && cam.snapshot) {
         const url = await loadSnapshot(cam.key);
+        if (route.name !== 'camera' || route.key !== routeKey || current) {
+          if (url) URL.revokeObjectURL(url);
+          return;
+        }
         if (url) {
-          const prev = stageImage.dataset.objectUrl;
-          if (prev) URL.revokeObjectURL(prev);
+          revokeImgObjectUrl(stageImage);
           stageImage.dataset.objectUrl = url;
           stageImage.src = url;
+          stageImage.dataset.loaded = '1';
           stageLabel.textContent = 'Live · snapshot';
         }
       }
     }
   } finally {
+    snapState.running = false;
     scheduleSnapshots();
   }
 }
@@ -1257,18 +1426,21 @@ if (stageLive) {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') pauseSnapshots();
-  else if (!snapState.paused) scheduleSnapshots();
-  else { /* stay paused until tap */ }
+  if (document.visibilityState === 'hidden') {
+    pauseSnapshots('hidden');
+  } else if (snapState.pausedForHidden || !snapState.paused) {
+    resumeSnapshots();
+  }
 });
 
 /* ── Home: Recent + tiles ─────────────────────────────────────────────────── */
 let recentFetchedAt = 0;
 let recentClips = [];
 let recentByCamera = new Map();
+let recentError = false;
 
 async function fetchRecent(force = false) {
-  if (!force && Date.now() - recentFetchedAt < RECENT_STALE_MS && recentFetchedAt > 0) {
+  if (!force && Date.now() - recentFetchedAt < RECENT_STALE_MS && recentFetchedAt > 0 && !recentError) {
     renderRecent();
     renderTiles();
     return;
@@ -1282,16 +1454,25 @@ async function fetchRecent(force = false) {
   });
   try {
     const response = await fetch(`api/recordings?${params}`);
-    const body = await response.json();
-    recentClips = response.ok ? (body.clips || []) : [];
-    recentFetchedAt = Date.now();
-    recentByCamera = new Map();
-    for (const clip of recentClips) {
-      const k = String(clip.camera_key);
-      if (!recentByCamera.has(k)) recentByCamera.set(k, clip);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      recentError = true;
+      recentClips = [];
+      recentByCamera = new Map();
+    } else {
+      recentError = false;
+      recentClips = body.clips || [];
+      recentFetchedAt = Date.now();
+      recentByCamera = new Map();
+      for (const clip of recentClips) {
+        const k = String(clip.camera_key);
+        if (!recentByCamera.has(k)) recentByCamera.set(k, clip);
+      }
     }
   } catch (err) {
+    recentError = true;
     recentClips = [];
+    recentByCamera = new Map();
   }
   renderRecent();
   renderTiles();
@@ -1300,19 +1481,39 @@ async function fetchRecent(force = false) {
 function renderRecent() {
   if (!recentStrip) return;
   recentStrip.innerHTML = '';
+  if (recentError) {
+    if (recentEmpty) {
+      recentEmpty.hidden = false;
+      recentEmpty.textContent = '';
+      const msg = document.createElement('span');
+      msg.textContent = 'Could not load recent recordings. ';
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'chip';
+      retry.textContent = 'Retry';
+      retry.addEventListener('click', () => fetchRecent(true));
+      recentEmpty.append(msg, retry);
+    }
+    return;
+  }
   const top = recentClips.slice(0, 12);
-  if (recentEmpty) recentEmpty.hidden = top.length > 0;
+  if (recentEmpty) {
+    recentEmpty.hidden = top.length > 0;
+    recentEmpty.textContent = 'No recordings in the last 6 hours';
+  }
   for (const clip of top) {
+    const item = document.createElement('div');
+    item.setAttribute('role', 'listitem');
     const card = document.createElement('button');
     card.type = 'button';
     card.className = 'recent-card';
-    card.setAttribute('role', 'listitem');
+    card.dataset.clipKey = clipKey(clip);
     const thumb = document.createElement('div');
     thumb.className = 'clip-thumb';
     const img = document.createElement('img');
     img.alt = '';
     img.dataset.src = `api/thumbnail/${clip.id}`;
-    img.dataset.clipKey = clipKey(clip);
+    img.dataset.refreshKey = clipKey(clip);
     thumb.appendChild(img);
     if (thumbObserver) thumbObserver.observe(img);
     else enqueueThumb(img);
@@ -1332,12 +1533,16 @@ function renderRecent() {
       const t = encodeURIComponent(clip.start);
       location.hash = `#/camera/${encodeURIComponent(clip.camera_key)}?t=${t}`;
     });
-    recentStrip.appendChild(card);
+    item.appendChild(card);
+    recentStrip.appendChild(item);
   }
 }
 
 function renderTiles() {
   if (!cameraTiles) return;
+  for (const img of cameraTiles.querySelectorAll('img[data-object-url]')) {
+    revokeImgObjectUrl(img);
+  }
   cameraTiles.innerHTML = '';
   for (const cam of cameras) {
     const tile = document.createElement('button');
@@ -1352,7 +1557,8 @@ function renderTiles() {
     media.appendChild(img);
     const paused = document.createElement('span');
     paused.className = 'tile-paused';
-    paused.hidden = !snapState.paused;
+    // Never show the paused overlay on tiles without HA snapshots.
+    paused.hidden = !(snapState.paused && cam.snapshot);
     paused.textContent = 'Paused · tap to resume';
     media.appendChild(paused);
 
@@ -1411,7 +1617,45 @@ const camState = {
   pendingT: null,
   generation: 0,
   scrollObs: null,
+  jumpDay: null,       // when set, timeline starts at this day (not today)
+  dayAbort: null,
+  loadInflight: 0,
 };
+
+function abortDayFetches() {
+  if (camState.dayAbort) camState.dayAbort.abort();
+  camState.dayAbort = new AbortController();
+  return camState.dayAbort;
+}
+
+function clearPendingEarlier() {
+  camState.pendingEarlier = false;
+}
+
+function recomputeEmptyStreak() {
+  // Trailing consecutive older empty days only (oldest end of newest-first list).
+  let streak = 0;
+  for (let i = camState.days.length - 1; i >= 0; i--) {
+    const d = camState.days[i];
+    if (!d.error && d.clips.length === 0) streak += 1;
+    else break;
+  }
+  camState.emptyStreak = streak;
+}
+
+function syncPlayerStickyOffset() {
+  if (!playerPanel) return;
+  const pinned = getComputedStyle(playerPanel).position === 'sticky'
+    && !playerPanel.hidden
+    && document.body.classList.contains('view-camera');
+  const h = pinned ? Math.ceil(playerPanel.getBoundingClientRect().height) : 0;
+  document.documentElement.style.setProperty('--player-sticky-offset', `${h}px`);
+}
+
+if (playerPanel && typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => syncPlayerStickyOffset()).observe(playerPanel);
+}
+window.addEventListener('resize', syncPlayerStickyOffset);
 
 function camNavClips() {
   const all = [];
@@ -1486,24 +1730,29 @@ function renderEventFilters() {
 
 function resetCameraState(key) {
   camState.generation++;
+  abortDayFetches();
   camState.key = key;
   camState.days = [];
   camState.seenKeys = new Set();
   camState.loading = false;
+  camState.loadInflight = 0;
   camState.pausedAuto = false;
   camState.emptyStreak = 0;
   camState.stopped = false;
   camState.canLoadOlder = true;
-  camState.pendingEarlier = false;
+  clearPendingEarlier();
+  camState.jumpDay = null;
   const saved = loadPref(STORE.filter(key), 'all');
   camState.filter = typeof saved === 'string' ? saved : 'all';
   if (vtimelineEl) vtimelineEl.innerHTML = '';
   if (cameraEnd) cameraEnd.hidden = true;
   if (loadEarlierBtn) loadEarlierBtn.hidden = true;
   if (daySentinel) daySentinel.hidden = false;
+  if (backToTodayBtn) backToTodayBtn.hidden = true;
+  if (dateJump) dateJump.max = localDate(new Date());
 }
 
-async function fetchDay(cameraKey, dayDate) {
+async function fetchDay(cameraKey, dayDate, signal) {
   const start = startOfLocalDay(dayDate);
   const end = localDate(dayDate) === localDate(new Date())
     ? new Date()
@@ -1513,7 +1762,7 @@ async function fetchDay(cameraKey, dayDate) {
     start: start.toISOString(),
     end: end.toISOString(),
   });
-  const response = await fetch(`api/recordings?${params}`);
+  const response = await fetch(`api/recordings?${params}`, signal ? { signal } : undefined);
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const err = new Error(body.detail || 'Day load failed');
@@ -1528,17 +1777,32 @@ function dayStrOf(d) {
 }
 
 function oldestLoadedDayDate() {
-  if (!camState.days.length) return startOfLocalDay(new Date());
+  if (!camState.days.length) {
+    return camState.jumpDay
+      ? startOfLocalDay(new Date(`${camState.jumpDay}T12:00:00`))
+      : startOfLocalDay(new Date());
+  }
   const last = camState.days[camState.days.length - 1].day;
   return startOfLocalDay(new Date(`${last}T12:00:00`));
+}
+
+function stillOnCamera(gen, key) {
+  // Generation + key are bumped/cleared on route leave; do not require route.name
+  // so direct loadDay callers (and in-flight fetches) stay coherent.
+  return gen === camState.generation && camState.key === key;
 }
 
 async function loadDay(dayDate, { prepend = false } = {}) {
   const day = dayStrOf(dayDate);
   if (camState.days.some((d) => d.day === day)) return camState.days.find((d) => d.day === day);
+  const gen = camState.generation;
+  const key = camState.key;
+  const signal = camState.dayAbort && camState.dayAbort.signal;
   camState.loading = true;
+  camState.loadInflight += 1;
   try {
-    const body = await fetchDay(camState.key, dayDate);
+    const body = await fetchDay(key, dayDate, signal);
+    if (!stillOnCamera(gen, key)) return null;
     const clips = [];
     for (const c of (body.clips || [])) {
       const k = clipKey(c);
@@ -1559,33 +1823,69 @@ async function loadDay(dayDate, { prepend = false } = {}) {
     else camState.days.unshift(entry);
     // Keep days sorted newest-first.
     camState.days.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
-    if (!clips.length) camState.emptyStreak += 1;
-    else camState.emptyStreak = 0;
+    recomputeEmptyStreak();
     return entry;
   } catch (err) {
+    if (err && err.name === 'AbortError') return null;
+    if (!stillOnCamera(gen, key)) return null;
     const entry = { day, clips: [], truncated: false, error: err.message || 'Failed', visibleCount: 0 };
     camState.days.push(entry);
     camState.days.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
     camState.pausedAuto = true; // failed day pauses auto-loading
+    clearPendingEarlier();
     return entry;
   } finally {
-    camState.loading = false;
+    camState.loadInflight = Math.max(0, camState.loadInflight - 1);
+    if (camState.loadInflight === 0) camState.loading = false;
+  }
+}
+
+function sentinelStillVisible() {
+  if (!daySentinel || daySentinel.hidden) return false;
+  // After observe(), IO fires on intersection changes; we also re-check geometry
+  // so a still-visible sentinel continues after a short/empty day load.
+  const rect = daySentinel.getBoundingClientRect();
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  // rootMargin: 100px — match the IntersectionObserver used by setupDaySentinel.
+  return rect.top < vh + 100 && rect.bottom > -100 && rect.width + rect.height > 0;
+}
+
+async function maybeContinueFromSentinel() {
+  // Bound the chain: stop rule is ≤7 empties or 30 days; never recurse forever.
+  for (let i = 0; i < MAX_DAYS_BACK + 2; i++) {
+    if (route.name !== 'camera') return;
+    if (camState.loading || camState.stopped || camState.pausedAuto) return;
+    if (!sentinelStillVisible()) return;
+    const last = camState.days[camState.days.length - 1];
+    if (last && last.clips.length > 0 && last.visibleCount === 0 && camState.filter !== 'all') {
+      if (loadEarlierBtn) loadEarlierBtn.hidden = false;
+      clearPendingEarlier();
+      return;
+    }
+    const before = camState.days.length;
+    await loadNextOlderDay();
+    if (camState.days.length === before) return;
   }
 }
 
 async function loadNextOlderDay() {
+  const gen = camState.generation;
+  const key = camState.key;
   if (camState.loading || camState.stopped) return;
   if (camState.pausedAuto) {
     if (loadEarlierBtn) loadEarlierBtn.hidden = false;
+    clearPendingEarlier();
     return;
   }
   const oldest = oldestLoadedDayDate();
   const next = addLocalDays(oldest, -1);
+  const nextDay = dayStrOf(next);
   const today = startOfLocalDay(new Date());
   const daysBack = Math.round((today - next) / 86400000);
   if (camState.emptyStreak >= EMPTY_DAY_STOP || daysBack >= MAX_DAYS_BACK) {
     camState.stopped = true;
     camState.canLoadOlder = false;
+    clearPendingEarlier();
     if (cameraEnd) {
       cameraEnd.hidden = false;
       cameraEnd.textContent = 'No older recordings';
@@ -1593,20 +1893,31 @@ async function loadNextOlderDay() {
     if (daySentinel) daySentinel.hidden = true;
     return;
   }
+  // Already have this day — do not tight-loop via a sync loadDay cache hit.
+  if (camState.days.some((d) => d.day === nextDay)) return;
+  const daysBefore = camState.days.length;
   const entry = await loadDay(next, { prepend: true });
+  if (!stillOnCamera(gen, key)) return;
+  if (!entry || camState.days.length === daysBefore) return;
   renderEventFilters();
   renderVTimeline();
   updateStopUi(entry);
   if (camState.pendingEarlier) {
-    camState.pendingEarlier = false;
     const j = neighbourIndex(-1);
-    if (j >= 0) openClip(j);
+    if (j >= 0) {
+      clearPendingEarlier();
+      openClip(j);
+    } else if (camState.stopped || camState.pausedAuto || !camState.canLoadOlder) {
+      clearPendingEarlier();
+    }
+    // else keep pendingEarlier and continue loading older below
   }
   updateNav();
 }
 
 function updateStopUi(entry) {
   if (camState.pausedAuto) {
+    clearPendingEarlier();
     if (loadEarlierBtn) {
       loadEarlierBtn.hidden = false;
       loadEarlierBtn.textContent = entry && entry.error ? 'Retry failed day' : 'Load earlier day';
@@ -1616,6 +1927,7 @@ function updateStopUi(entry) {
   // Auto-load only while last loaded day added ≥1 visible card OR is empty.
   // When a filter hides everything, show "Load earlier day" instead.
   if (entry && entry.clips.length > 0 && entry.visibleCount === 0 && camState.filter !== 'all') {
+    clearPendingEarlier();
     if (loadEarlierBtn) {
       loadEarlierBtn.hidden = false;
       loadEarlierBtn.textContent = 'Load earlier day';
@@ -1626,6 +1938,7 @@ function updateStopUi(entry) {
   if (camState.emptyStreak >= EMPTY_DAY_STOP) {
     camState.stopped = true;
     camState.canLoadOlder = false;
+    clearPendingEarlier();
     if (cameraEnd) {
       cameraEnd.hidden = false;
       cameraEnd.textContent = 'No older recordings';
@@ -1668,13 +1981,17 @@ function renderVTimeline() {
       btn.className = 'chip';
       btn.textContent = 'Retry';
       btn.addEventListener('click', async () => {
+        const gen = camState.generation;
+        const key = camState.key;
         camState.days = camState.days.filter((d) => d.day !== day.day);
         camState.pausedAuto = false;
         const d = startOfLocalDay(new Date(`${day.day}T12:00:00`));
         const entry = await loadDay(d);
+        if (!stillOnCamera(gen, key)) return;
         renderEventFilters();
         renderVTimeline();
         updateStopUi(entry);
+        await maybeContinueFromSentinel();
       });
       retry.append(msg, btn);
       section.appendChild(retry);
@@ -1762,7 +2079,9 @@ function updateDateChipFromScroll() {
     return;
   }
   let currentDay = sections[0].dataset.day;
-  const stickyBottom = (dateChip.getBoundingClientRect().bottom || 0) + 8;
+  // Measure against the sticky bar (offset below the pinned player).
+  const bar = timelineSticky || dateChip;
+  const stickyBottom = (bar.getBoundingClientRect().bottom || 0) + 8;
   for (const sec of sections) {
     if (sec.getBoundingClientRect().top <= stickyBottom) currentDay = sec.dataset.day;
   }
@@ -1770,13 +2089,40 @@ function updateDateChipFromScroll() {
   if (dateJump) dateJump.value = currentDay;
 }
 
+function clearStageImage() {
+  if (!stageImage) return;
+  if (thumbObserver) {
+    try { thumbObserver.unobserve(stageImage); } catch (err) { /* ignore */ }
+  }
+  dropThumbIfQueued(stageImage);
+  revokeImgObjectUrl(stageImage);
+  delete stageImage.dataset.loaded;
+  delete stageImage.dataset.queued;
+  delete stageImage.dataset.src;
+  delete stageImage.dataset.refreshKey;
+  stageImage.removeAttribute('src');
+}
+
+async function loadStageThumbnail(clip) {
+  if (!stageImage || !clip) return;
+  const routeKey = route.key;
+  stageImage.dataset.src = `api/thumbnail/${clip.id}`;
+  stageImage.dataset.refreshKey = clipKey(clip);
+  delete stageImage.dataset.loaded;
+  delete stageImage.dataset.queued;
+  await fetchThumbInto(stageImage, { force: true });
+  if (route.name !== 'camera' || route.key !== routeKey) return;
+}
+
 function updateStageForCamera() {
   if (!route.key) return;
   playerPanel.hidden = false;
   showStageChrome();
+  syncPlayerStickyOffset();
   const cam = cameras.find((c) => c.key === route.key);
   playerCamera.textContent = cam ? cam.name : route.key;
   playerTime.textContent = '';
+  clearStageImage();
   if (cam && cam.snapshot) {
     stageLabel.textContent = 'Live · snapshot';
     if (!snapState.paused) {
@@ -1787,20 +2133,14 @@ function updateStageForCamera() {
     stageLabel.textContent = 'Latest recording';
     const newest = recentByCamera.get(route.key)
       || (camState.days[0] && camState.days[0].clips[0]);
-    if (newest) {
-      stageImage.removeAttribute('src');
-      stageImage.dataset.src = `api/thumbnail/${newest.id}`;
-      if (thumbObserver) thumbObserver.observe(stageImage);
-      else enqueueThumb(stageImage);
-    } else {
-      stageImage.removeAttribute('src');
-    }
+    if (newest) loadStageThumbnail(newest);
   }
 }
 
 async function enterCamera(key, tIso) {
   if (cameraTitle) cameraTitle.textContent = cameraName(key);
   resetCameraState(key);
+  const gen = camState.generation;
   camState.pendingT = tIso || null;
 
   let focusDay = startOfLocalDay(new Date());
@@ -1812,12 +2152,15 @@ async function enterCamera(key, tIso) {
   // Always ensure Today is loaded; if t is another day, load that day too.
   const today = startOfLocalDay(new Date());
   await loadDay(today);
+  if (!stillOnCamera(gen, key)) return;
   if (dayStrOf(focusDay) !== dayStrOf(today)) {
     await loadDay(focusDay);
+    if (!stillOnCamera(gen, key)) return;
   }
   renderEventFilters();
   renderVTimeline();
   updateStopUi(camState.days[camState.days.length - 1]);
+  syncPlayerStickyOffset();
 
   if (!current) updateStageForCamera();
   else showPlayingChrome();
@@ -1829,11 +2172,12 @@ async function enterCamera(key, tIso) {
     for (const d of camState.days) for (const c of d.clips) all.push(c);
     const match = all.find((c) => clipKey(c) === targetKey)
       || all.find((c) => Math.abs(Date.parse(c.start) - Date.parse(tIso)) < 2000);
-    if (current) {
+    if (!stillOnCamera(gen, key)) return;
+    if (current && route.name === 'camera' && String(current.clip.camera_key) === String(key)) {
       // Already opened from Recent tap — just scroll.
       const el = vtimelineEl && vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(current.clip))}"]`);
       if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
-    } else if (match) {
+    } else if (match && route.name === 'camera' && route.key === key) {
       openClip(match);
       const el = vtimelineEl && vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(match))}"]`);
       if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
@@ -1844,6 +2188,8 @@ async function enterCamera(key, tIso) {
   }
 
   setupDaySentinel();
+  // Kick the sentinel once: IntersectionObserver only fires on changes.
+  maybeContinueFromSentinel();
 }
 
 function setupDaySentinel() {
@@ -1860,15 +2206,18 @@ function setupDaySentinel() {
         if (loadEarlierBtn) loadEarlierBtn.hidden = false;
         return;
       }
-      loadNextOlderDay();
+      maybeContinueFromSentinel();
     }
   }, { rootMargin: '100px' });
   daySentinel.hidden = false;
+  // Re-observe so a still-visible sentinel fires again after a short day load.
   camState.scrollObs.observe(daySentinel);
 }
 
 if (loadEarlierBtn) {
   loadEarlierBtn.addEventListener('click', async () => {
+    const gen = camState.generation;
+    const key = camState.key;
     if (camState.pausedAuto) {
       // Retry the failed day (last with error) or just resume.
       const failed = [...camState.days].reverse().find((d) => d.error);
@@ -1876,9 +2225,11 @@ if (loadEarlierBtn) {
         camState.days = camState.days.filter((d) => d.day !== failed.day);
         camState.pausedAuto = false;
         await loadDay(startOfLocalDay(new Date(`${failed.day}T12:00:00`)));
+        if (!stillOnCamera(gen, key)) return;
         renderEventFilters();
         renderVTimeline();
         updateStopUi(camState.days[camState.days.length - 1]);
+        await maybeContinueFromSentinel();
         return;
       }
       camState.pausedAuto = false;
@@ -1887,22 +2238,58 @@ if (loadEarlierBtn) {
   });
 }
 
+async function jumpCameraToDay(dayDate) {
+  const gen = camState.generation;
+  const key = camState.key;
+  const day = dayStrOf(dayDate);
+  const today = localDate(new Date());
+  camState.days = [];
+  camState.seenKeys = new Set();
+  camState.emptyStreak = 0;
+  camState.stopped = false;
+  camState.canLoadOlder = true;
+  camState.pausedAuto = false;
+  clearPendingEarlier();
+  camState.jumpDay = day === today ? null : day;
+  if (cameraEnd) cameraEnd.hidden = true;
+  if (daySentinel) daySentinel.hidden = false;
+  if (backToTodayBtn) backToTodayBtn.hidden = day === today;
+  abortDayFetches();
+  await loadDay(dayDate);
+  if (!stillOnCamera(gen, key)) return;
+  renderEventFilters();
+  renderVTimeline();
+  updateStopUi(camState.days[camState.days.length - 1]);
+  const sec = vtimelineEl && vtimelineEl.querySelector(`.vday[data-day="${day}"]`);
+  if (sec) sec.scrollIntoView({ block: 'start' });
+  setupDaySentinel();
+  maybeContinueFromSentinel();
+}
+
 if (dateChip && dateJump) {
+  dateJump.max = localDate(new Date());
   dateChip.addEventListener('click', () => dateJump.showPicker ? dateJump.showPicker() : dateJump.click());
   dateJump.addEventListener('change', async () => {
     if (!dateJump.value || route.name !== 'camera') return;
+    const today = localDate(new Date());
+    if (dateJump.value > today) dateJump.value = today;
     const d = startOfLocalDay(new Date(`${dateJump.value}T12:00:00`));
-    await loadDay(d);
-    renderEventFilters();
-    renderVTimeline();
-    const sec = vtimelineEl.querySelector(`.vday[data-day="${dateJump.value}"]`);
-    if (sec) sec.scrollIntoView({ block: 'start' });
+    await jumpCameraToDay(d);
+  });
+}
+
+if (backToTodayBtn) {
+  backToTodayBtn.addEventListener('click', async () => {
+    if (route.name !== 'camera') return;
+    await jumpCameraToDay(startOfLocalDay(new Date()));
   });
 }
 
 if (refreshTodayBtn) {
   refreshTodayBtn.addEventListener('click', async () => {
     if (route.name !== 'camera') return;
+    const gen = camState.generation;
+    const key = camState.key;
     const today = localDate(new Date());
     // Drop today's clips from seenKeys and reload.
     const old = camState.days.find((d) => d.day === today);
@@ -1911,6 +2298,7 @@ if (refreshTodayBtn) {
       camState.days = camState.days.filter((d) => d.day !== today);
     }
     await loadDay(startOfLocalDay(new Date()));
+    if (!stillOnCamera(gen, key)) return;
     renderEventFilters();
     renderVTimeline();
   });
@@ -1946,11 +2334,18 @@ function disposeRoute() {
   }
   markActive(null);
   camState.generation++;
+  abortDayFetches();
+  clearPendingEarlier();
   camState.key = null;
   camState.days = [];
+  camState.loading = false;
+  camState.loadInflight = 0;
+  camState.jumpDay = null;
   if (vtimelineEl) vtimelineEl.innerHTML = '';
   if (camState.scrollObs) { camState.scrollObs.disconnect(); camState.scrollObs = null; }
+  clearStageImage();
   clearSnapTimer();
+  syncPlayerStickyOffset();
 }
 
 async function applyRoute() {
@@ -1975,6 +2370,8 @@ async function applyRoute() {
   } else if (leaving && keepPlaying) {
     // Still bump camera state but keep the player.
     camState.generation++;
+    abortDayFetches();
+    clearPendingEarlier();
     if (camState.scrollObs) { camState.scrollObs.disconnect(); camState.scrollObs = null; }
   }
 
