@@ -54,12 +54,15 @@ const pad = (n) => String(n).padStart(2, '0');
 const localDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const localTime = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 const clockTime = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+// Timeline, Recent and cards: minutes are enough and keep narrow phone columns on one line.
+const shortTime = (d) => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 const cssEsc = (s) => (window.CSS && CSS.escape) ? CSS.escape(String(s))
   : String(s).replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);
 
 const PAGE_ROWS = 200;
 const EVENT_VOCAB = ['motion', 'person', 'vehicle', 'animal', 'face', 'doorbell', 'scheduled', 'alarm'];
-const FILTER_CHIPS = ['person', 'vehicle', 'animal', 'motion']; // All is separate
+// Every vocabulary type that occurs gets a chip (design §10.8); All is separate.
+const FILTER_CHIPS = ['person', 'vehicle', 'animal', 'face', 'doorbell', 'motion', 'scheduled', 'alarm'];
 const IDLE_MS = 2 * 60 * 1000;
 const SNAP_HOME_MS = 60 * 1000;
 const SNAP_CAMERA_MS = 5 * 1000;
@@ -1227,6 +1230,10 @@ function applyTileSnapshot(key, url) {
   if (prev) URL.revokeObjectURL(prev);
   img.dataset.objectUrl = url;
   img.src = url;
+  // .clip-thumb images stay at opacity 0 until .loaded — without this the
+  // snapshot loads but the tile still shows the placeholder.
+  const media = img.closest('.clip-thumb');
+  if (media) media.classList.add('loaded', 'has-image');
   tile.classList.add('has-image');
 }
 
@@ -1316,7 +1323,7 @@ function renderRecent() {
     name.textContent = clip.camera_name || cameraName(clip.camera_key);
     const when = document.createElement('div');
     when.className = 'recent-when';
-    when.textContent = clockTime(new Date(clip.start));
+    when.textContent = shortTime(new Date(clip.start));
     meta.append(name, when, eventBadges(clip));
     card.append(thumb, meta);
     card.addEventListener('click', () => {
@@ -1695,7 +1702,7 @@ function renderVTimeline() {
 
       const time = document.createElement('div');
       time.className = 'vrow-time';
-      time.textContent = clockTime(new Date(clip.start));
+      time.textContent = shortTime(new Date(clip.start));
 
       const barCol = document.createElement('div');
       barCol.className = 'vrow-bar';
@@ -1711,8 +1718,11 @@ function renderVTimeline() {
       cardBody.className = 'vrow-card-body';
       const t = document.createElement('div');
       t.className = 'vrow-card-time';
-      t.textContent = `${clockTime(new Date(clip.start))} · ${formatDuration(clip.duration_s)}`;
-      cardBody.append(t, eventBadges(clip));
+      t.textContent = shortTime(new Date(clip.start));
+      const dur = document.createElement('div');
+      dur.className = 'vrow-card-duration';
+      dur.textContent = formatDuration(clip.duration_s);
+      cardBody.append(t, dur, eventBadges(clip));
       attachThumb(card, clip);
       card.appendChild(cardBody);
       card.addEventListener('click', () => openClip(clip));

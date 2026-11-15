@@ -627,6 +627,10 @@ async function runCase({ clip, behaviour, raw, quality }) {
     check('home tile with snapshot:true gets a snapshot image',
           !!document.querySelector('#camera-tiles [data-camera="dvr-101"] .tile-img').src,
           document.querySelector('#camera-tiles [data-camera="dvr-101"] .tile-img').src);
+    // style.css keeps .clip-thumb images at opacity 0 until .loaded — a src alone
+    // still shows the placeholder (bug found in review, v0.5.0).
+    check('home tile snapshot is made visible (.loaded on its media)',
+          document.querySelector('#camera-tiles [data-camera="dvr-101"] .tile-media').classList.contains('loaded'));
     const porchImg = document.querySelector('#camera-tiles [data-camera="reolink-0"] .tile-img');
     check('home tile without snapshot uses thumbnail dataset',
           porchImg.dataset.src === 'api/thumbnail/r1', porchImg.dataset.src);
