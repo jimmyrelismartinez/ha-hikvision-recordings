@@ -910,10 +910,24 @@ function setCameraClipTime(clip) {
 }
 
 /** Mode-neutral scroll: wide centres in the filmstrip; narrow uses scrollIntoView. */
+// A smooth centring in flight: a filmstrip re-render (e.g. an older day landing)
+// would cancel the animation and restore a mid-animation offset, so the render
+// re-centres this card instantly instead.
+let fsPendingCenter = null; // { key, until }
+if (vtimelineEl) {
+  // The animation finished, or the user took over the strip: stop re-centring.
+  const dropPendingCenter = () => { fsPendingCenter = null; };
+  for (const type of ['scrollend', 'wheel', 'pointerdown', 'touchstart', 'keydown']) {
+    vtimelineEl.addEventListener(type, dropPendingCenter, { passive: true });
+  }
+}
+
 function scrollTimelineTo(el, { smooth = false, align = 'nearest' } = {}) {
   if (!el) return;
   if (isWide() && route.name === 'camera' && vtimelineEl && vtimelineEl.classList.contains('filmstrip')) {
     const left = el.offsetLeft + (el.offsetWidth / 2) - (vtimelineEl.clientWidth / 2);
+    fsPendingCenter = (smooth && el.dataset.clipKey)
+      ? { key: el.dataset.clipKey, until: Date.now() + 1000 } : null;
     if (smooth && typeof vtimelineEl.scrollTo === 'function') {
       vtimelineEl.scrollTo({ left: Math.max(0, left), behavior: 'smooth' });
     } else {
@@ -2217,6 +2231,13 @@ function renderFilmstrip() {
   }
   // Preserve distance from the right edge (older days prepend on the left).
   vtimelineEl.scrollLeft = Math.max(0, vtimelineEl.scrollWidth - fromRight);
+  if (fsPendingCenter && Date.now() < fsPendingCenter.until) {
+    const pending = vtimelineEl.querySelector(`.fs-card[data-clip-key="${cssEsc(fsPendingCenter.key)}"]`);
+    if (pending) {
+      vtimelineEl.scrollLeft = Math.max(0,
+        pending.offsetLeft + (pending.offsetWidth / 2) - (vtimelineEl.clientWidth / 2));
+    }
+  }
   if (current) markActive(clipKey(current.clip));
   updateDateChipFromScroll();
 }

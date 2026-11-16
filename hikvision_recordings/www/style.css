@@ -500,50 +500,40 @@ body.view-camera.layout-wide > header { display: none; }
 body.view-camera.layout-wide .camera-toolbar {
   flex: none; margin-bottom: 0.25rem;
 }
+/* Player: video fills the free space (row 1); quality/download + Earlier/Later
+   share one row underneath (row 2); hint (row 3) only when it has text.
+   .player-body is display:contents so its bar/video/hint are grid items. */
 body.view-camera.layout-wide .player-panel {
   flex: 1 1 auto; min-height: 0; position: static;
-  display: flex; flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  column-gap: 0.75rem;
   margin: 0; padding: 0.4rem 0.5rem; border-radius: 10px;
 }
 body.view-camera.layout-wide .player-head { display: none; }
-body.view-camera.layout-wide .player-body {
-  display: contents;
-}
-body.view-camera.layout-wide .stage-live {
-  display: flex; flex-direction: column;
-  flex: 1 1 0; min-height: 0; width: 100%; order: 0;
-  position: relative;
-}
-body.view-camera.layout-wide .stage-image {
-  flex: 1 1 0; min-height: 0; width: 100%; max-height: none;
-  object-fit: contain; border-radius: 8px;
-}
-body.view-camera.layout-wide .player-body video {
-  flex: 1 1 0; min-height: 0; width: 100%; max-height: none;
-  object-fit: contain; order: 0;
-}
-body.view-camera.layout-wide .clip-controls {
-  flex: 1 1 auto; margin: 0.35rem 0 0; order: 1; min-width: 0;
-}
-body.view-camera.layout-wide .player-nav {
-  flex: 1 1 auto; margin: 0.35rem 0 0; order: 2; min-width: 0;
-}
-body.view-camera.layout-wide .player-body .hint {
-  flex: 0 0 100%; order: 3; margin: 0.2rem 0 0;
-}
-body.view-camera.layout-wide .keys-hint { display: none !important; }
-/* clip-controls + player-nav share one row under the video (display:contents body). */
-body.view-camera.layout-wide .player-panel {
-  flex-wrap: wrap; align-content: stretch;
-}
+body.view-camera.layout-wide .player-body { display: contents; }
 body.view-camera.layout-wide .stage-live,
 body.view-camera.layout-wide .player-body video {
-  flex: 1 1 100%;
+  grid-column: 1 / -1; grid-row: 1;
+  width: 100%; height: 100%; min-height: 0; max-height: none;
 }
-body.view-camera.layout-wide .clip-controls,
+body.view-camera.layout-wide .player-body video { object-fit: contain; }
+body.view-camera.layout-wide .stage-live { position: relative; }
+body.view-camera.layout-wide .stage-image {
+  width: 100%; height: 100%; min-height: 0; max-height: none;
+  object-fit: contain; border-radius: 8px;
+}
+body.view-camera.layout-wide .clip-controls {
+  grid-column: 1; grid-row: 2; margin: 0.35rem 0 0; min-width: 0;
+}
 body.view-camera.layout-wide .player-nav {
-  flex: 1 1 40%;
+  grid-column: 2; grid-row: 2; margin: 0.35rem 0 0;
 }
+body.view-camera.layout-wide .player-body .hint {
+  grid-column: 1 / -1; grid-row: 3; margin: 0.2rem 0 0;
+}
+body.view-camera.layout-wide .keys-hint { display: none !important; }
 
 body.view-camera.layout-wide .camera-chrome {
   flex: none;
@@ -585,6 +575,7 @@ body.view-camera.layout-wide #day-sentinel {
 }
 
 .filmstrip {
+  position: relative; /* offsetParent for card centring maths */
   display: flex; flex-direction: row; align-items: stretch;
   gap: 0.45rem; overflow-x: auto; overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
@@ -598,16 +589,17 @@ body.view-camera.layout-wide #day-sentinel {
   border-left: 2px solid var(--border);
 }
 .fs-card {
-  flex: none; width: 168px; height: 100%; max-height: 100%;
-  display: flex; flex-direction: column; text-align: left;
+  /* Horizontal card: the dock is short, so thumbnail left, text right. */
+  flex: none; height: 100%; max-height: 100%;
+  display: flex; flex-direction: row; align-items: stretch; text-align: left;
   background: var(--panel); border: 2px solid transparent; border-radius: 10px;
   box-shadow: var(--shadow); padding: 0; color: var(--text); overflow: hidden;
 }
 .fs-card .clip-thumb {
-  flex: 1 1 auto; min-height: 0; width: 100%; aspect-ratio: 16 / 9;
-  border-bottom: 1px solid var(--border);
+  flex: none; height: 100%; width: auto; aspect-ratio: 16 / 9; min-height: 0;
+  border-bottom: 0; border-right: 1px solid var(--border);
 }
-.fs-card-body { flex: none; padding: 0.25rem 0.4rem 0.35rem; }
+.fs-card-body { flex: none; width: 7.5rem; padding: 0.35rem 0.5rem; overflow: hidden; }
 .fs-card-time { font-weight: 600; font-size: 0.8rem; }
 .fs-card-duration { color: var(--muted); font-size: 0.7rem; font-variant-numeric: tabular-nums; }
 .fs-card.active { border-color: var(--seg-active); }

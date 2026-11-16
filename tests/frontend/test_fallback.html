@@ -1402,6 +1402,8 @@ async function runCase({ clip, behaviour, raw, quality }) {
       const z0 = dayClip('z0', 'reolink-0', 'Porch', 'reolink', -10, 11, 0, ['motion']);
       const zDay = localDate(new Date(z0.start));
       camState.days = camState.days.filter((d) => d.day !== zDay);
+      // The user grabs the strip (cancels the segment click's pending centring), then scrolls.
+      strip.dispatchEvent(new Event('pointerdown'));
       strip.scrollLeft = Math.max(0, strip.scrollWidth - strip.clientWidth - 40);
       const fromRightBefore = strip.scrollWidth - strip.scrollLeft;
       camState.days.push({
@@ -1414,6 +1416,27 @@ async function runCase({ clip, behaviour, raw, quality }) {
       check('wide: prepend keeps scrollWidth-scrollLeft',
             Math.abs(fromRightAfter - fromRightBefore) <= 2,
             `before=${fromRightBefore} after=${fromRightAfter}`);
+
+      // A re-render landing mid smooth-centre (older day arrives right after a
+      // click) keeps the clicked card centred instead of a stale offset.
+      {
+        const target = strip.querySelector('.fs-card[data-clip-key]');
+        scrollTimelineTo(target, { smooth: true });
+        const z1 = dayClip('z1', 'reolink-0', 'Porch', 'reolink', -11, 9, 0, ['motion']);
+        const z1Day = localDate(new Date(z1.start));
+        camState.days = camState.days.filter((d) => d.day !== z1Day);
+        camState.days.push({ day: z1Day, clips: [z1], truncated: false, error: null, visibleCount: 1 });
+        camState.days.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
+        camState.seenKeys.add(clipKey(z1));
+        renderFilmstrip();
+        const again = strip.querySelector(`.fs-card[data-clip-key="${CSS.escape(target.dataset.clipKey)}"]`);
+        const sr = strip.getBoundingClientRect();
+        const cr = again.getBoundingClientRect();
+        const off = Math.abs((cr.left + cr.width / 2) - (sr.left + sr.width / 2));
+        check('wide: pending smooth centre survives a prepend re-render', off <= 4 || strip.scrollLeft === 0,
+              `off=${Math.round(off)} sl=${strip.scrollLeft}`);
+        strip.dispatchEvent(new Event('pointerdown'));
+      }
 
       // scroll-near-left triggers older-day load via maybeContinueFromSentinel path.
       let olderLoads = 0;
