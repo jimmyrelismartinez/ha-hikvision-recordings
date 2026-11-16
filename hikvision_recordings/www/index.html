@@ -36,6 +36,7 @@
     <div class="camera-toolbar">
       <a href="#/" id="camera-back" class="back-link">← Cameras</a>
       <h2 id="camera-title" class="camera-title"></h2>
+      <span id="camera-clip-time" class="camera-clip-time" hidden></span>
       <button type="button" id="live-button" class="live-button" hidden>● Live</button>
     </div>
     <div id="stage-slot" class="stage-slot" aria-hidden="true"></div>
@@ -47,6 +48,7 @@
         <div id="event-filters" class="event-filters" hidden role="group" aria-label="Event type"></div>
         <button type="button" id="refresh-today" class="icon-button" title="Refresh today" aria-label="Refresh today">↻</button>
       </div>
+      <div id="daybar" class="daybar" hidden aria-hidden="true"></div>
       <div id="vtimeline" class="vtimeline"></div>
       <div id="day-sentinel" class="day-sentinel" hidden></div>
       <p id="camera-end" class="message" hidden></p>
