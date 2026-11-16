@@ -1,6 +1,10 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>app.js playback fallback tests</title></head>
+<head>
+  <meta charset="utf-8">
+  <title>app.js playback fallback tests</title>
+  <link rel="stylesheet" href="/hikvision_recordings/www/style.css">
+</head>
 <body class="view-all">
 <!--
   Exercises the REAL hikvision_recordings/www/app.js — not a copy — against stubbed
@@ -27,18 +31,26 @@
   <div id="camera-tiles"></div>
 </section>
 <section id="view-camera" hidden>
-  <a href="#/" id="camera-back"></a>
-  <h2 id="camera-title"></h2>
-  <button type="button" id="live-button" hidden>● Live</button>
-  <button type="button" id="date-chip">Today</button>
-  <input type="date" id="date-jump">
-  <button type="button" id="back-to-today" hidden>Back to today</button>
-  <div id="event-filters" hidden></div>
-  <button type="button" id="refresh-today"></button>
-  <div id="vtimeline"></div>
-  <div id="day-sentinel" hidden></div>
-  <p id="camera-end" hidden></p>
-  <button type="button" id="load-earlier" hidden></button>
+  <div class="camera-toolbar">
+    <a href="#/" id="camera-back" class="back-link">← Cameras</a>
+    <h2 id="camera-title" class="camera-title"></h2>
+    <span id="camera-clip-time" class="camera-clip-time" hidden></span>
+    <button type="button" id="live-button" class="live-button" hidden>● Live</button>
+  </div>
+  <div class="camera-chrome">
+    <div class="timeline-sticky">
+      <button type="button" id="date-chip" class="date-chip">Today</button>
+      <input type="date" id="date-jump" class="date-jump">
+      <button type="button" id="back-to-today" class="chip" hidden>Back to today</button>
+      <div id="event-filters" class="event-filters" hidden></div>
+      <button type="button" id="refresh-today" class="icon-button"></button>
+    </div>
+    <div id="daybar" class="daybar" hidden></div>
+    <div id="vtimeline" class="vtimeline"></div>
+    <div id="day-sentinel" class="day-sentinel" hidden></div>
+    <p id="camera-end" class="message" hidden></p>
+    <button type="button" id="load-earlier" class="show-more" hidden></button>
+  </div>
 </section>
 <section id="view-all">
 <form id="search-form">
@@ -50,19 +62,24 @@
 <div id="banners"></div><div id="timeline" hidden></div>
 <ul id="results"></ul><button type="button" id="show-more" hidden></button>
 </section>
-<section id="player-panel" hidden>
-  <span id="player-camera"></span><span id="player-time"></span>
-  <button type="button" id="player-close"></button>
-  <div id="stage-live" hidden>
-    <img id="stage-image" alt="">
-    <p id="stage-label"></p>
-    <p id="stage-paused" hidden></p>
+<section id="player-panel" class="player-panel" hidden>
+  <div class="player-head">
+    <div class="player-title">
+      <span id="player-camera" class="player-camera"></span>
+      <span id="player-time" class="player-time"></span>
+    </div>
+    <button type="button" id="player-close" class="icon-button"></button>
   </div>
-  <div id="player-body"></div>
+  <div id="stage-live" class="stage-live" hidden>
+    <img id="stage-image" class="stage-image" alt="">
+    <p id="stage-label" class="stage-label"></p>
+    <p id="stage-paused" class="stage-paused" hidden></p>
+  </div>
+  <div id="player-body" class="player-body"></div>
   <div class="player-nav">
-    <button type="button" id="prev-clip"></button>
-    <input type="checkbox" id="autoplay">
-    <button type="button" id="next-clip"></button>
+    <button type="button" id="prev-clip" class="nav-button"></button>
+    <label class="toggle"><input type="checkbox" id="autoplay"> Autoplay</label>
+    <button type="button" id="next-clip" class="nav-button"></button>
   </div>
 </section>
 <div id="cases"></div>
@@ -247,6 +264,9 @@ async function runCase({ clip, behaviour, raw, quality }) {
 
 (async function () {
   try {
+    // Lock narrow layout for regression tests (headless viewports can match the wide MQ).
+    window.__forceWide = false;
+
     // 1. ffmpeg.wasm not present at all -> never attempt, never error.
     let r = await runCase({ clip: SMALL_CLIP, behaviour: null });
     check('no ffmpeg.wasm -> compatibility mode', r.mode === 'compat', r.mode);
@@ -1311,6 +1331,186 @@ async function runCase({ clip, behaviour, raw, quality }) {
       recomputeEmptyStreak();
       check('MINOR emptyStreak resets when older day has clips', camState.emptyStreak === 0,
             String(camState.emptyStreak));
+    }
+
+    // ── v0.6.0 landscape filmstrip / day bar (design §8 + §10) ───────────────
+    {
+      const w0 = dayClip('w0', 'reolink-0', 'Porch', 'reolink', 0, 9, 0, ['person']);
+      const w1 = dayClip('w1', 'reolink-0', 'Porch', 'reolink', 0, 12, 0, ['vehicle']);
+      const w2 = dayClip('w2', 'reolink-0', 'Porch', 'reolink', 0, 15, 0, ['person']);
+      const y0 = dayClip('y0', 'reolink-0', 'Porch', 'reolink', -1, 14, 0, ['motion']);
+      window.__recordingsFor = (u) => {
+        const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+        const day = localDate(new Date(start));
+        if (day === localDate(new Date(w0.start))) {
+          return { clips: [w2, w1, w0], truncated: false, truncated_cameras: [], errors: [] };
+        }
+        if (day === localDate(new Date(y0.start))) {
+          return { clips: [y0], truncated: false, truncated_cameras: [], errors: [] };
+        }
+        return { clips: [], truncated: false, truncated_cameras: [], errors: [] };
+      };
+      window.__forceWide = true;
+      location.hash = '#/camera/reolink-0';
+      await until(() => document.body.classList.contains('view-camera')
+        && document.body.classList.contains('layout-wide')
+        && document.querySelector('#vtimeline.filmstrip .fs-card'));
+      const strip = document.getElementById('vtimeline');
+      const cardIds = [...strip.querySelectorAll('.fs-card')].map((c) => c.dataset.clipId);
+      const iW0 = cardIds.indexOf('w0');
+      const iW1 = cardIds.indexOf('w1');
+      const iW2 = cardIds.indexOf('w2');
+      check('wide: filmstrip cards ascending (oldest left)',
+            iW0 >= 0 && iW0 < iW1 && iW1 < iW2,
+            cardIds.join(','));
+      // Ensure yesterday is loaded so day separators appear in order.
+      await loadDay(startOfLocalDay(new Date(y0.start)), { prepend: true });
+      renderVTimeline();
+      const days = [...strip.querySelectorAll('.fs-day')].map((d) => d.dataset.day);
+      check('wide: day separators oldest→newest',
+            days.length >= 2 && days.every((d, i) => i === 0 || days[i - 1] <= d),
+            days.join(','));
+
+      // Filter hides cards but day bar keeps dimmed segments.
+      camState.filter = 'person';
+      renderEventFilters();
+      renderVTimeline();
+      const visibleCards = [...strip.querySelectorAll('.fs-card')].map((c) => c.dataset.clipId);
+      check('wide: filter hides non-matching cards',
+            visibleCards.includes('w0') && visibleCards.includes('w2') && !visibleCards.includes('w1'),
+            visibleCards.join(','));
+      const segs = [...document.querySelectorAll('#daybar .db-seg')];
+      const dimSeg = segs.find((s) => s.dataset.clipId === 'w1');
+      check('wide: day bar keeps dimmed segments for filtered clips',
+            !!dimSeg && dimSeg.classList.contains('dim') && segs.length >= 3,
+            `segs=${segs.length} dim=${!!dimSeg}`);
+
+      // Segment click opens the right clip.
+      const segW2 = document.querySelector('#daybar .db-seg[data-clip-id="w2"]');
+      segW2.click();
+      await until(() => current && current.clip.id === 'w2');
+      check('wide: day-bar segment click opens clip', current && current.clip.id === 'w2',
+            current && current.clip && current.clip.id);
+      check('wide: markActive on fs-card and db-seg',
+            !!document.querySelector('.fs-card.active[data-clip-id="w2"]')
+            && !!document.querySelector('.db-seg.active[data-clip-id="w2"]'));
+
+      // Prepend older day keeps scrollWidth - scrollLeft.
+      camState.filter = 'all';
+      renderVTimeline();
+      // Use a day far enough back that auto-continue has not already loaded it.
+      const z0 = dayClip('z0', 'reolink-0', 'Porch', 'reolink', -10, 11, 0, ['motion']);
+      const zDay = localDate(new Date(z0.start));
+      camState.days = camState.days.filter((d) => d.day !== zDay);
+      strip.scrollLeft = Math.max(0, strip.scrollWidth - strip.clientWidth - 40);
+      const fromRightBefore = strip.scrollWidth - strip.scrollLeft;
+      camState.days.push({
+        day: zDay, clips: [z0], truncated: false, error: null, visibleCount: 1,
+      });
+      camState.days.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
+      camState.seenKeys.add(clipKey(z0));
+      renderFilmstrip();
+      const fromRightAfter = strip.scrollWidth - strip.scrollLeft;
+      check('wide: prepend keeps scrollWidth-scrollLeft',
+            Math.abs(fromRightAfter - fromRightBefore) <= 2,
+            `before=${fromRightBefore} after=${fromRightAfter}`);
+
+      // scroll-near-left triggers older-day load via maybeContinueFromSentinel path.
+      let olderLoads = 0;
+      const prevFor = window.__recordingsFor;
+      window.__recordingsFor = (u) => {
+        olderLoads += 1;
+        const start = new URLSearchParams(u.split('?')[1] || '').get('start');
+        const startMs = Date.parse(start);
+        const back = Math.round(
+          (startOfLocalDay(new Date()).getTime() - startOfLocalDay(new Date(startMs)).getTime()) / 86400000
+        );
+        return {
+          clips: [dayClip(`old${back}`, 'reolink-0', 'Porch', 'reolink', -back, 10, 0)],
+          truncated: false, truncated_cameras: [], errors: [],
+        };
+      };
+      camState.stopped = false;
+      camState.pausedAuto = false;
+      camState.canLoadOlder = true;
+      camState.emptyStreak = 0;
+      if (cameraEnd) cameraEnd.hidden = true;
+      if (daySentinel) daySentinel.hidden = false;
+      const daysBefore = camState.days.length;
+      // Wide mode: scrollLeft < 300 is the continue signal (design §10.3).
+      strip.scrollLeft = 0;
+      check('wide: sentinelStillVisible at left edge', sentinelStillVisible() === true);
+      await maybeContinueFromSentinel();
+      check('wide: scroll-near-left triggers older-day load',
+            olderLoads >= 1 && camState.days.length > daysBefore,
+            `loads=${olderLoads} before=${daysBefore} after=${camState.days.length}`);
+      window.__recordingsFor = prevFor;
+
+      // Wheel → horizontal (stub scrollLeft so layout width cannot clamp it).
+      let wheelLeft = 50;
+      Object.defineProperty(strip, 'scrollLeft', {
+        configurable: true,
+        get() { return wheelLeft; },
+        set(v) { wheelLeft = v; },
+      });
+      strip.dispatchEvent(new WheelEvent('wheel', {
+        deltaY: 80, deltaX: 0, deltaMode: 0, bubbles: true, cancelable: true,
+      }));
+      check('wide: wheel deltaY scrolls horizontally', wheelLeft === 130, String(wheelLeft));
+      delete strip.scrollLeft;
+
+      // Mode switch keeps the same <video> and current.
+      openClip(w0);
+      await until(() => current && current.clip.id === 'w0');
+      const videoBefore = panelVideo;
+      const curBefore = current;
+      window.__forceWide = false;
+      applyLayoutMode();
+      await sleep(30);
+      check('wide→narrow: same <video> node and current',
+            panelVideo === videoBefore && current === curBefore
+            && document.body.classList.contains('layout-wide') === false
+            && !!document.querySelector('#vtimeline.vtimeline .vrow'),
+            `wide=${document.body.classList.contains('layout-wide')} current=${current && current.clip && current.clip.id}`);
+      window.__forceWide = true;
+      applyLayoutMode();
+      await sleep(30);
+      check('narrow→wide: same <video> node and current',
+            panelVideo === videoBefore && current === curBefore
+            && document.body.classList.contains('layout-wide')
+            && !!document.querySelector('#vtimeline.filmstrip .fs-card'),
+            `wide=${document.body.classList.contains('layout-wide')}`);
+
+      // Video box ≥55% of viewport height at 1280×720 in wide mode.
+      const measureStyle = document.createElement('style');
+      measureStyle.textContent = 'body.view-camera.layout-wide{height:720px!important;width:1280px!important;}';
+      document.head.appendChild(measureStyle);
+      document.body.classList.add('view-camera', 'layout-wide');
+      playerPanel.hidden = false;
+      showPlayingChrome();
+      // Ensure video is in the panel for flex measurement.
+      if (!panelVideo.isConnected) playerBody.appendChild(panelVideo);
+      panelVideo.style.minHeight = '0';
+      await sleep(40);
+      const vh = 720;
+      const videoBox = panelVideo.getBoundingClientRect().height
+        || document.getElementById('stage-live').getBoundingClientRect().height;
+      // Prefer the flex area of the player panel above the dock.
+      const panelH = playerPanel.getBoundingClientRect().height;
+      const dockH = document.querySelector('.camera-chrome').getBoundingClientRect().height;
+      const toolbarH = document.querySelector('.camera-toolbar').getBoundingClientRect().height;
+      const approxVideo = vh - dockH - toolbarH - 16; // body padding
+      check('wide: video box ≥55% viewport height at 1280×720',
+            (videoBox >= 0.55 * vh) || (approxVideo >= 0.55 * vh) || (panelH >= 0.55 * vh),
+            `video=${videoBox} panel=${panelH} approx=${approxVideo} dock=${dockH}`);
+      measureStyle.remove();
+
+      // Restore narrow for any trailing checks.
+      window.__forceWide = false;
+      applyLayoutMode();
+      if (current) closePlayer();
+      location.hash = '#/';
+      await until(() => document.body.classList.contains('view-home'));
     }
 
   } catch (err) {
