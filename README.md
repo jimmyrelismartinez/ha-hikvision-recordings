@@ -71,6 +71,14 @@ the Supervisor token is present. `/api/health` reports `"ha_api": "ok"|"off"`.
 - Hash routes only (Ingress-safe). One `<video>` for the whole app; `#player-panel` is
   never re-parented.
 
+### Landscape layout (v0.6.0)
+
+On the camera page only, when the Ingress iframe is wide enough
+(`min-width: 800px`, `min-height: 480px`, `min-aspect-ratio: 4/3`), the UI switches to a
+no-page-scroll layout: video fills the space above a bottom dock with the filter bar,
+a 24-hour day bar, and a horizontal thumbnail filmstrip (oldest left, newest right).
+Portrait phones and the home / All recordings pages keep the previous layout.
+
 ### Browsing and playback (v0.3.0)
 
 - **Cameras:** "All" plus one chip per camera. Pick any mix; picking every camera

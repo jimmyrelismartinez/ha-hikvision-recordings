@@ -1,5 +1,5 @@
 name: DVR Recordings
-version: "0.5.0"
+version: "0.6.0"
 slug: hikvision_recordings
 description: Browse, play and download existing recordings from a Hikvision DVR/NVR and Reolink cameras
 url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings
