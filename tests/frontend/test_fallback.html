@@ -1504,29 +1504,29 @@ async function runCase({ clip, behaviour, raw, quality }) {
             && !!document.querySelector('#vtimeline.filmstrip .fs-card'),
             `wide=${document.body.classList.contains('layout-wide')}`);
 
-      // Video box ≥55% of viewport height at 1280×720 in wide mode.
-      const measureStyle = document.createElement('style');
-      measureStyle.textContent = 'body.view-camera.layout-wide{height:720px!important;width:1280px!important;}';
-      document.head.appendChild(measureStyle);
+      // Wide player structure. (Real pixel sizes can't be measured in this harness
+      // page; they are checked with real-Chrome probes against the mock server.)
       document.body.classList.add('view-camera', 'layout-wide');
       playerPanel.hidden = false;
       showPlayingChrome();
-      // Ensure video is in the panel for flex measurement.
       if (!panelVideo.isConnected) playerBody.appendChild(panelVideo);
-      panelVideo.style.minHeight = '0';
-      await sleep(40);
-      const vh = 720;
-      const videoBox = panelVideo.getBoundingClientRect().height
-        || document.getElementById('stage-live').getBoundingClientRect().height;
-      // Prefer the flex area of the player panel above the dock.
-      const panelH = playerPanel.getBoundingClientRect().height;
-      const dockH = document.querySelector('.camera-chrome').getBoundingClientRect().height;
-      const toolbarH = document.querySelector('.camera-toolbar').getBoundingClientRect().height;
-      const approxVideo = vh - dockH - toolbarH - 16; // body padding
-      check('wide: video box ≥55% viewport height at 1280×720',
-            (videoBox >= 0.55 * vh) || (approxVideo >= 0.55 * vh) || (panelH >= 0.55 * vh),
-            `video=${videoBox} panel=${panelH} approx=${approxVideo} dock=${dockH}`);
-      measureStyle.remove();
+      await sleep(20);
+      {
+        const cs = (sel) => { const el = document.querySelector(sel); return el ? getComputedStyle(el) : null; };
+        const panel = getComputedStyle(playerPanel);
+        const ctrls = cs('.clip-controls');
+        const nav = cs('.player-nav');
+        const vid = getComputedStyle(panelVideo);
+        const card = cs('.fs-card');
+        check('wide: player is a grid — video row 1, controls + Earlier/Later share row 2',
+              panel.display === 'grid'
+              && vid.gridRowStart === '1'
+              && (!ctrls || ctrls.gridRowStart === '2') && nav && nav.gridRowStart === '2'
+              && (!ctrls || ctrls.gridColumnStart !== nav.gridColumnStart),
+              `panel=${panel.display} video=${vid.gridRowStart} ctrls=${ctrls && ctrls.gridRowStart}/${ctrls && ctrls.gridColumnStart} nav=${nav && nav.gridRowStart}/${nav && nav.gridColumnStart}`);
+        check('wide: filmstrip cards are horizontal (thumb beside text)',
+              !!card && card.flexDirection === 'row', `card=${card && card.flexDirection}`);
+      }
 
       // Restore narrow for any trailing checks.
       window.__forceWide = false;
