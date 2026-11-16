@@ -151,3 +151,69 @@ Screenshots (mock server): 1280×800, 1920×1080, 1024×768 (wide); 390×844 and
 
 Version 0.6.0 (`config.yaml`, test_api version assertion, README section
 "Landscape layout").
+
+## 10. Resolutions after goldfish review (override earlier sections)
+
+10.1 **Vertical budget (B1).** In wide mode: hide the global `header` (the toolbar's
+"← Cameras" link is the way back) and `.player-head` (camera name is already the
+toolbar title; the clip date/time/duration moves to a new toolbar span
+`#camera-clip-time`, set in `openClip`, cleared on Live). `.clip-controls` and
+`.player-nav` share **one row** under the video. Body padding 0.5rem. Dock height
+`clamp(170px, 26vh, 200px)`. Test: at 1280×720 the video box is ≥ 55% of the
+viewport height.
+
+10.2 **Breakpoint (B2).** The add-on runs in HA's Ingress iframe (sidebar + top
+bar removed), so measure the iframe:
+`(min-width: 800px) and (min-height: 480px) and (min-aspect-ratio: 4/3)`.
+Phone landscape (≤ ~430 px tall) stays excluded. Screenshots at iframe sizes
+1024×620, 1110×600, 1664×1000 (wide) and 390×844, 844×390 (unchanged).
+
+10.3 **Older days in wide mode (M1, replaces §4 "Loading older days").** Do not
+move `#day-sentinel`, `#load-earlier`, `#camera-end`, and do not add a second
+IO root. In wide mode the strip's `scroll` listener (rAF-throttled) calls
+`maybeContinueFromSentinel()` when `scrollLeft < 300`; `sentinelStillVisible()`
+returns `strip.scrollLeft < 300` in wide mode (also true right after a render of a
+strip that doesn't overflow). `#load-earlier` / `#camera-end` are shown in the
+filter-bar row via CSS in wide mode.
+
+10.4 **markActive (M2).** Add `.fs-card[data-clip-key]` and `.db-seg[data-clip-key]`
+to its selector; day-bar re-render re-applies active.
+
+10.5 **One scroll helper (M3).** `scrollTimelineTo(el, { smooth, align })` used by
+all sites (enterCamera ×3, jumpCameraToDay, openClip). Day elements use a
+mode-neutral `[data-day]` selector. Wide mode sets `strip.scrollLeft` directly
+(centre the card) — never `scrollIntoView` (it would scroll the hidden-overflow
+body and the parent HA frame). Narrow mode keeps today's `scrollIntoView` calls.
+
+10.6 **Scroll preservation inside `renderFilmstrip()` (M4).** Capture
+`fromRight = scrollWidth - scrollLeft` before clearing, restore after building, for
+every re-render; explicit jumps override afterwards. First render (empty strip,
+fromRight = 0) lands on newest automatically — no separate "initial scroll" code.
+Filter change: keep the active card centred if it passes, else the nearest passing
+card by time to the previously centred one.
+
+10.7 **Video sizing (M5).** `.player-body` and `.stage-live` are flex columns;
+video / stage image `flex: 1 1 0; min-height: 0; width: 100%; object-fit: contain`.
+
+10.8 **Date jump (M6).** In wide mode land on the **newest clip of that day** (right
+end of its group), consistent with vertical mode.
+
+10.9 **Minors adopted.**
+- Date chip: dispatcher branches; wide mode computes the focused day from the
+  strip centre on strip scroll (no `.vday` lookup).
+- Fullscreen: ignore MQ `change` while `document.fullscreenElement`; re-evaluate
+  on `fullscreenchange`.
+- Day-bar segments: `tabindex="-1"`, `aria-hidden="true"` (cards carry the info).
+  Arrow keys keep seeking ±5 s (documented).
+- Wheel → horizontal: skip when `ctrlKey`; multiply by 16 for `deltaMode === 1`,
+  by strip width for `deltaMode === 2`.
+- Tests: `isWide()` reads `window.__forceWide ?? WIDE_MQ.matches`; the MQ change
+  handler is exposed (e.g. `window.__applyLayoutMode()`) for the mode-switch test.
+- Gaps: computed between consecutive clips of **all** clips (as vertical mode);
+  under a filter, gap labels are hidden.
+- Re-render cost: full re-render accepted for now (same as vertical); revisit if
+  slow.
+
+10.10 **Cut.** Sentinel re-parenting, dual-root IO, moving stop UI into the strip,
+separate initial-scroll logic, DST special case: day-bar position is
+`(start − dayStart) / (nextDayStart − dayStart)` with local-midnight bounds.
