@@ -40,10 +40,12 @@ const dateJump = $('date-jump');
 const backToTodayBtn = $('back-to-today');
 const eventFiltersEl = $('event-filters');
 const vtimelineEl = $('vtimeline');
+const daybarEl = $('daybar');
 const daySentinel = $('day-sentinel');
 const cameraEnd = $('camera-end');
 const loadEarlierBtn = $('load-earlier');
 const refreshTodayBtn = $('refresh-today');
+const cameraClipTime = $('camera-clip-time');
 const stageLive = $('stage-live');
 const stageImage = $('stage-image');
 const stageLabel = $('stage-label');
@@ -51,6 +53,15 @@ const stagePaused = $('stage-paused');
 const tabCameras = $('tab-cameras');
 const tabAll = $('tab-all');
 const timelineSticky = document.querySelector('.timeline-sticky');
+
+/* Wide layout: Ingress iframe size (design §10.2). Phones stay on the vertical UI. */
+const WIDE_MQ = window.matchMedia
+  ? window.matchMedia('(min-width: 800px) and (min-height: 480px) and (min-aspect-ratio: 4/3)')
+  : { matches: false, addEventListener() {}, addListener() {} };
+function isWide() {
+  if (typeof window.__forceWide === 'boolean') return window.__forceWide;
+  return !!WIDE_MQ.matches;
+}
 
 const pad = (n) => String(n).padStart(2, '0');
 const localDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -877,10 +888,42 @@ function updateNav() {
 
 function markActive(key) {
   // Only row/segment containers — not thumbnail <img>s (those carry data-refresh-key).
-  for (const el of document.querySelectorAll('.clip[data-clip-key], .tl-seg[data-clip-key], .vrow[data-clip-key], .recent-card[data-clip-key]')) {
+  for (const el of document.querySelectorAll(
+    '.clip[data-clip-key], .tl-seg[data-clip-key], .vrow[data-clip-key], .recent-card[data-clip-key], .fs-card[data-clip-key], .db-seg[data-clip-key]'
+  )) {
     const on = !!key && el.dataset.clipKey === key;
     el.classList.toggle('active', on);
     if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
+  }
+}
+
+function setCameraClipTime(clip) {
+  if (!cameraClipTime) return;
+  if (!clip) {
+    cameraClipTime.hidden = true;
+    cameraClipTime.textContent = '';
+    return;
+  }
+  const start = new Date(clip.start);
+  cameraClipTime.hidden = false;
+  cameraClipTime.textContent = `${start.toLocaleDateString()} ${clockTime(start)} · ${formatDuration(clip.duration_s)}`;
+}
+
+/** Mode-neutral scroll: wide centres in the filmstrip; narrow uses scrollIntoView. */
+function scrollTimelineTo(el, { smooth = false, align = 'nearest' } = {}) {
+  if (!el) return;
+  if (isWide() && route.name === 'camera' && vtimelineEl && vtimelineEl.classList.contains('filmstrip')) {
+    const left = el.offsetLeft + (el.offsetWidth / 2) - (vtimelineEl.clientWidth / 2);
+    if (smooth && typeof vtimelineEl.scrollTo === 'function') {
+      vtimelineEl.scrollTo({ left: Math.max(0, left), behavior: 'smooth' });
+    } else {
+      vtimelineEl.scrollLeft = Math.max(0, left);
+    }
+    return;
+  }
+  const block = align === 'center' ? 'center' : align === 'start' ? 'start' : 'nearest';
+  if (el.scrollIntoView) {
+    el.scrollIntoView({ block, behavior: smooth ? 'smooth' : 'auto' });
   }
 }
 
@@ -903,6 +946,7 @@ function showStageChrome() {
   if (closeButton) closeButton.hidden = true;
   const nav = playerPanel && playerPanel.querySelector('.player-nav');
   if (nav) nav.hidden = true;
+  setCameraClipTime(null);
 }
 
 function openClip(indexOrClip) {
@@ -935,10 +979,11 @@ function openClip(indexOrClip) {
   current = { clip, player };
   updateNav();
   markActive(clipKey(clip));
+  if (route.name === 'camera') setCameraClipTime(clip);
   // Scroll the camera-timeline card into view when Earlier/Later/Autoplay moves.
   if (route.name === 'camera') {
     const el = vtimelineEl && vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(clip))}"]`);
-    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    scrollTimelineTo(el, { smooth: true, align: 'nearest' });
   }
 }
 
@@ -1716,10 +1761,22 @@ function renderEventFilters() {
     chip.textContent = label;
     chip.setAttribute('aria-pressed', String(camState.filter === value));
     chip.addEventListener('click', () => {
+      const prevCenter = filmstripCenterClip();
       camState.filter = value;
       savePref(STORE.filter(camState.key), value);
       renderEventFilters();
       renderVTimeline();
+      // Filter change: keep active centred if it still passes, else nearest by time.
+      if (isWide()) {
+        const active = current && clipPassesFilter(current.clip) ? current.clip : null;
+        const target = active || nearestPassingTo(prevCenter);
+        if (target) {
+          const el = vtimelineEl && vtimelineEl.querySelector(
+            `.fs-card[data-clip-key="${cssEsc(clipKey(target))}"]`
+          );
+          scrollTimelineTo(el, { align: 'center' });
+        }
+      }
       updateNav();
     });
     eventFiltersEl.appendChild(chip);
@@ -1841,6 +1898,11 @@ async function loadDay(dayDate, { prepend = false } = {}) {
 }
 
 function sentinelStillVisible() {
+  // Wide mode: left-edge proximity on the filmstrip (design §10.3). Also true
+  // right after a render of a strip that does not overflow.
+  if (isWide() && route.name === 'camera' && vtimelineEl) {
+    return vtimelineEl.scrollLeft < 300;
+  }
   if (!daySentinel || daySentinel.hidden) return false;
   // After observe(), IO fires on intersection changes; we also re-check geometry
   // so a still-visible sentinel continues after a short/empty day load.
@@ -1946,9 +2008,224 @@ function updateStopUi(entry) {
   }
 }
 
-function renderVTimeline() {
+function dayRetryHandler(day) {
+  return async () => {
+    const gen = camState.generation;
+    const key = camState.key;
+    camState.days = camState.days.filter((d) => d.day !== day.day);
+    camState.pausedAuto = false;
+    const d = startOfLocalDay(new Date(`${day.day}T12:00:00`));
+    const entry = await loadDay(d);
+    if (!stillOnCamera(gen, key)) return;
+    renderEventFilters();
+    renderVTimeline();
+    updateStopUi(entry);
+    await maybeContinueFromSentinel();
+  };
+}
+
+function filmstripCenterClip() {
+  if (!vtimelineEl || !vtimelineEl.classList.contains('filmstrip')) return null;
+  const cards = [...vtimelineEl.querySelectorAll('.fs-card[data-clip-key]')];
+  if (!cards.length) return null;
+  const mid = vtimelineEl.getBoundingClientRect().left + vtimelineEl.clientWidth / 2;
+  let best = cards[0];
+  let bestDist = Infinity;
+  for (const card of cards) {
+    const r = card.getBoundingClientRect();
+    const c = (r.left + r.right) / 2;
+    const dist = Math.abs(c - mid);
+    if (dist < bestDist) { bestDist = dist; best = card; }
+  }
+  const key = best.dataset.clipKey;
+  for (const day of camState.days) {
+    for (const c of day.clips) if (clipKey(c) === key) return c;
+  }
+  return null;
+}
+
+function nearestPassingTo(clip) {
+  if (!clip) return null;
+  const list = camNavClips();
+  if (!list.length) return null;
+  const t = Date.parse(clip.start);
+  let best = list[0];
+  let bestDist = Math.abs(Date.parse(best.start) - t);
+  for (const c of list) {
+    const d = Math.abs(Date.parse(c.start) - t);
+    if (d < bestDist) { bestDist = d; best = c; }
+  }
+  return best;
+}
+
+function focusedDayFromFilmstrip() {
+  const clip = filmstripCenterClip();
+  if (clip) return localDate(new Date(clip.start));
+  const sep = vtimelineEl && vtimelineEl.querySelector('.fs-day[data-day]');
+  return sep ? sep.dataset.day : localDate(new Date());
+}
+
+function renderDaybar(dayStr) {
+  if (!daybarEl) return;
+  if (!(isWide() && route.name === 'camera')) {
+    daybarEl.hidden = true;
+    daybarEl.innerHTML = '';
+    return;
+  }
+  daybarEl.hidden = false;
+  daybarEl.innerHTML = '';
+  const dayEntry = camState.days.find((d) => d.day === dayStr);
+  const dayStart = startOfLocalDay(new Date(`${dayStr}T12:00:00`));
+  const dayEnd = addLocalDays(dayStart, 1);
+  const span = Math.max(1, dayEnd.getTime() - dayStart.getTime());
+  const track = document.createElement('div');
+  track.className = 'db-track';
+  for (const h of [0, 6, 12, 18, 24]) {
+    const tick = document.createElement('span');
+    tick.className = 'db-tick';
+    tick.dataset.at = String(h);
+    tick.style.left = `${(h / 24) * 100}%`;
+    if (h === 24) tick.textContent = '24:00';
+    else {
+      const label = new Date(dayStart.getTime());
+      label.setHours(h, 0, 0, 0);
+      tick.textContent = localTime(label);
+    }
+    track.appendChild(tick);
+  }
+  const clips = dayEntry ? dayEntry.clips.slice() : [];
+  for (const clip of clips) {
+    const s = Date.parse(clip.start);
+    const e = Date.parse(clip.end);
+    const left = ((s - dayStart.getTime()) / span) * 100;
+    const width = Math.max(3, ((Math.max(e, s + 1000) - s) / span) * 100);
+    const seg = document.createElement('button');
+    seg.type = 'button';
+    seg.className = 'db-seg' + (clipPassesFilter(clip) ? '' : ' dim');
+    seg.dataset.clipKey = clipKey(clip);
+    seg.dataset.clipId = clip.id;
+    seg.tabIndex = -1;
+    seg.setAttribute('aria-hidden', 'true');
+    seg.style.left = `${Math.max(0, Math.min(100, left))}%`;
+    seg.style.width = `${Math.min(100 - Math.max(0, left), width)}%`;
+    const when = shortTime(new Date(clip.start));
+    seg.setAttribute('aria-label', `${when}, ${formatDuration(clip.duration_s)}`);
+    seg.addEventListener('click', () => openClip(clip));
+    track.appendChild(seg);
+  }
+  if (dayStr === localDate(new Date())) {
+    const now = Date.now();
+    if (now >= dayStart.getTime() && now <= dayEnd.getTime()) {
+      const marker = document.createElement('span');
+      marker.className = 'db-now';
+      marker.style.left = `${((now - dayStart.getTime()) / span) * 100}%`;
+      track.appendChild(marker);
+    }
+  }
+  daybarEl.appendChild(track);
+  if (current) markActive(clipKey(current.clip));
+}
+
+function renderFilmstrip() {
   if (!vtimelineEl) return;
+  const fromRight = vtimelineEl.scrollWidth - vtimelineEl.scrollLeft;
+  vtimelineEl.className = 'filmstrip';
   vtimelineEl.innerHTML = '';
+  for (const day of camState.days) {
+    day.visibleCount = day.clips.filter(clipPassesFilter).length;
+  }
+  const today = localDate(new Date());
+  const showGaps = camState.filter === 'all';
+  // Oldest left → newest right: reverse the newest-first days list.
+  const daysAsc = camState.days.slice().reverse();
+  for (const day of daysAsc) {
+    const sep = document.createElement('div');
+    sep.className = 'fs-day';
+    sep.dataset.day = day.day;
+    sep.textContent = dayLabel(day.day) + (day.truncated ? ' (partial)' : '');
+    if (day.truncated) sep.title = 'Not every clip of this day could be listed';
+    vtimelineEl.appendChild(sep);
+
+    if (day.error) {
+      const retry = document.createElement('div');
+      retry.className = 'vday-error';
+      const msg = document.createElement('span');
+      msg.textContent = `Could not load ${dayLabel(day.day)}: ${day.error}`;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chip';
+      btn.textContent = 'Retry';
+      btn.addEventListener('click', dayRetryHandler(day));
+      retry.append(msg, btn);
+      vtimelineEl.appendChild(retry);
+      continue;
+    }
+
+    const ordered = day.clips.slice().sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+    if (!ordered.length) {
+      const empty = document.createElement('div');
+      empty.className = 'fs-placeholder';
+      empty.textContent = 'No recordings';
+      vtimelineEl.appendChild(empty);
+    } else if (day.visibleCount === 0 && camState.filter !== 'all') {
+      const empty = document.createElement('div');
+      empty.className = 'fs-placeholder';
+      empty.textContent = `No ${camState.filter} clips`;
+      vtimelineEl.appendChild(empty);
+    }
+
+    for (let i = 0; i < ordered.length; i++) {
+      const clip = ordered[i];
+      const next = ordered[i + 1];
+      if (clipPassesFilter(clip)) {
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'fs-card';
+        card.dataset.clipKey = clipKey(clip);
+        card.dataset.clipId = clip.id;
+        const cardBody = document.createElement('div');
+        cardBody.className = 'fs-card-body';
+        const t = document.createElement('div');
+        t.className = 'fs-card-time';
+        t.textContent = shortTime(new Date(clip.start));
+        const dur = document.createElement('div');
+        dur.className = 'fs-card-duration';
+        dur.textContent = formatDuration(clip.duration_s);
+        cardBody.append(t, dur, eventBadges(clip));
+        attachThumb(card, clip);
+        card.appendChild(cardBody);
+        card.addEventListener('click', () => openClip(clip));
+        vtimelineEl.appendChild(card);
+      }
+      if (showGaps && next) {
+        const chronologicalGap = (Date.parse(next.start) - Date.parse(clip.end)) / 1000;
+        if (chronologicalGap >= GAP_BAND_MIN_S) {
+          const band = document.createElement('div');
+          band.className = 'fs-gap';
+          band.textContent = formatGap(chronologicalGap);
+          vtimelineEl.appendChild(band);
+        }
+      }
+    }
+
+    if (day.day === today) {
+      const nowMark = document.createElement('div');
+      nowMark.className = 'fs-now';
+      nowMark.textContent = 'Now';
+      vtimelineEl.appendChild(nowMark);
+    }
+  }
+  // Preserve distance from the right edge (older days prepend on the left).
+  vtimelineEl.scrollLeft = Math.max(0, vtimelineEl.scrollWidth - fromRight);
+  if (current) markActive(clipKey(current.clip));
+  updateDateChipFromScroll();
+}
+
+function renderVerticalTimeline() {
+  if (!vtimelineEl) return;
+  vtimelineEl.className = 'vtimeline';
+  vtimelineEl.innerHTML = '';
+  if (daybarEl) { daybarEl.hidden = true; daybarEl.innerHTML = ''; }
   for (const day of camState.days) {
     day.visibleCount = day.clips.filter(clipPassesFilter).length;
   }
@@ -1973,26 +2250,13 @@ function renderVTimeline() {
     if (day.error) {
       const retry = document.createElement('div');
       retry.className = 'vday-error';
-      retry.innerHTML = '';
       const msg = document.createElement('span');
       msg.textContent = `Could not load ${dayLabel(day.day)}: ${day.error}`;
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'chip';
       btn.textContent = 'Retry';
-      btn.addEventListener('click', async () => {
-        const gen = camState.generation;
-        const key = camState.key;
-        camState.days = camState.days.filter((d) => d.day !== day.day);
-        camState.pausedAuto = false;
-        const d = startOfLocalDay(new Date(`${day.day}T12:00:00`));
-        const entry = await loadDay(d);
-        if (!stillOnCamera(gen, key)) return;
-        renderEventFilters();
-        renderVTimeline();
-        updateStopUi(entry);
-        await maybeContinueFromSentinel();
-      });
+      btn.addEventListener('click', dayRetryHandler(day));
       retry.append(msg, btn);
       section.appendChild(retry);
       vtimelineEl.appendChild(section);
@@ -2071,8 +2335,21 @@ function renderVTimeline() {
   updateDateChipFromScroll();
 }
 
+function renderVTimeline() {
+  if (!vtimelineEl) return;
+  if (isWide() && route.name === 'camera') renderFilmstrip();
+  else renderVerticalTimeline();
+}
+
 function updateDateChipFromScroll() {
   if (!dateChip || !vtimelineEl) return;
+  if (isWide() && vtimelineEl.classList.contains('filmstrip')) {
+    const day = focusedDayFromFilmstrip();
+    dateChip.textContent = dayLabel(day);
+    if (dateJump) dateJump.value = day;
+    renderDaybar(day);
+    return;
+  }
   const sections = [...vtimelineEl.querySelectorAll('.vday')];
   if (!sections.length) {
     dateChip.textContent = 'Today';
@@ -2176,14 +2453,14 @@ async function enterCamera(key, tIso) {
     if (current && route.name === 'camera' && String(current.clip.camera_key) === String(key)) {
       // Already opened from Recent tap — just scroll.
       const el = vtimelineEl && vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(current.clip))}"]`);
-      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+      scrollTimelineTo(el, { align: 'center' });
     } else if (match && route.name === 'camera' && route.key === key) {
       openClip(match);
       const el = vtimelineEl && vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(match))}"]`);
-      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+      scrollTimelineTo(el, { align: 'center' });
     } else {
-      const dayEl = vtimelineEl && vtimelineEl.querySelector(`.vday[data-day="${dayStrOf(focusDay)}"]`);
-      if (dayEl && dayEl.scrollIntoView) dayEl.scrollIntoView({ block: 'start' });
+      const dayEl = vtimelineEl && vtimelineEl.querySelector(`[data-day="${dayStrOf(focusDay)}"]`);
+      scrollTimelineTo(dayEl, { align: 'start' });
     }
   }
 
@@ -2260,8 +2537,24 @@ async function jumpCameraToDay(dayDate) {
   renderEventFilters();
   renderVTimeline();
   updateStopUi(camState.days[camState.days.length - 1]);
-  const sec = vtimelineEl && vtimelineEl.querySelector(`.vday[data-day="${day}"]`);
-  if (sec) sec.scrollIntoView({ block: 'start' });
+  // Wide: land on newest clip of that day (right end of its group). Narrow: day head.
+  if (isWide()) {
+    const cards = vtimelineEl
+      ? [...vtimelineEl.querySelectorAll(`.fs-card`)].filter((c) => {
+        const entry = camState.days.find((d) => d.day === day);
+        return entry && entry.clips.some((cl) => clipKey(cl) === c.dataset.clipKey);
+      })
+      : [];
+    const newest = cards[cards.length - 1];
+    if (newest) scrollTimelineTo(newest, { align: 'center' });
+    else {
+      const sep = vtimelineEl && vtimelineEl.querySelector(`[data-day="${day}"]`);
+      scrollTimelineTo(sep, { align: 'start' });
+    }
+  } else {
+    const sec = vtimelineEl && vtimelineEl.querySelector(`[data-day="${day}"]`);
+    scrollTimelineTo(sec, { align: 'start' });
+  }
   setupDaySentinel();
   maybeContinueFromSentinel();
 }
@@ -2305,11 +2598,71 @@ if (refreshTodayBtn) {
 }
 
 if (liveButton) liveButton.addEventListener('click', returnToLive);
+
+let filmstripScrollRaf = 0;
+function onFilmstripScroll() {
+  if (filmstripScrollRaf) return;
+  filmstripScrollRaf = requestAnimationFrame(() => {
+    filmstripScrollRaf = 0;
+    if (route.name !== 'camera' || !isWide()) return;
+    updateDateChipFromScroll();
+    if (vtimelineEl && vtimelineEl.scrollLeft < 300) maybeContinueFromSentinel();
+  });
+}
+
+function onFilmstripWheel(ev) {
+  if (!isWide() || !vtimelineEl || !vtimelineEl.classList.contains('filmstrip')) return;
+  if (ev.ctrlKey) return;
+  if (Math.abs(ev.deltaY) <= Math.abs(ev.deltaX)) return;
+  let dy = ev.deltaY;
+  if (ev.deltaMode === 1) dy *= 16;
+  else if (ev.deltaMode === 2) dy *= vtimelineEl.clientWidth;
+  vtimelineEl.scrollLeft += dy;
+  ev.preventDefault();
+}
+
 if (vtimelineEl) {
   window.addEventListener('scroll', () => {
-    if (route.name === 'camera') updateDateChipFromScroll();
+    if (route.name === 'camera' && !isWide()) updateDateChipFromScroll();
   }, { passive: true });
+  vtimelineEl.addEventListener('scroll', onFilmstripScroll, { passive: true });
+  vtimelineEl.addEventListener('wheel', onFilmstripWheel, { passive: false });
 }
+
+function applyLayoutMode() {
+  // Ignore MQ flips while the video is fullscreen; re-check on fullscreenchange.
+  if (document.fullscreenElement) return;
+  const want = route.name === 'camera' && isWide();
+  const had = document.body.classList.contains('layout-wide');
+  document.body.classList.toggle('layout-wide', want);
+  if (route.name !== 'camera') {
+    if (daybarEl) { daybarEl.hidden = true; daybarEl.innerHTML = ''; }
+    if (vtimelineEl) vtimelineEl.className = 'vtimeline';
+    syncPlayerStickyOffset();
+    return;
+  }
+  if (want !== had || (want && !vtimelineEl.classList.contains('filmstrip'))
+      || (!want && vtimelineEl && vtimelineEl.classList.contains('filmstrip'))) {
+    renderVTimeline();
+    const activeEl = current && vtimelineEl
+      ? vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(current.clip))}"]`)
+      : null;
+    if (activeEl) scrollTimelineTo(activeEl, { align: 'center' });
+    else if (want && vtimelineEl) {
+      // Newest is at the right; fromRight=0 on first paint already lands there.
+      vtimelineEl.scrollLeft = Math.max(0, vtimelineEl.scrollWidth - vtimelineEl.clientWidth);
+    }
+  }
+  syncPlayerStickyOffset();
+}
+window.__applyLayoutMode = applyLayoutMode;
+
+if (WIDE_MQ.addEventListener) {
+  WIDE_MQ.addEventListener('change', () => applyLayoutMode());
+} else if (WIDE_MQ.addListener) {
+  WIDE_MQ.addListener(() => applyLayoutMode());
+}
+document.addEventListener('fullscreenchange', () => applyLayoutMode());
 
 /* ── Routing ──────────────────────────────────────────────────────────────── */
 function parseHash() {
@@ -2341,10 +2694,13 @@ function disposeRoute() {
   camState.loading = false;
   camState.loadInflight = 0;
   camState.jumpDay = null;
-  if (vtimelineEl) vtimelineEl.innerHTML = '';
+  if (vtimelineEl) { vtimelineEl.innerHTML = ''; vtimelineEl.className = 'vtimeline'; }
+  if (daybarEl) { daybarEl.hidden = true; daybarEl.innerHTML = ''; }
+  setCameraClipTime(null);
   if (camState.scrollObs) { camState.scrollObs.disconnect(); camState.scrollObs = null; }
   clearStageImage();
   clearSnapTimer();
+  document.body.classList.remove('layout-wide');
   syncPlayerStickyOffset();
 }
 
@@ -2378,6 +2734,7 @@ async function applyRoute() {
   route = next;
   document.body.classList.remove('view-home', 'view-camera', 'view-all');
   document.body.classList.add(`view-${next.name}`);
+  if (next.name !== 'camera') document.body.classList.remove('layout-wide');
 
   if (viewHome) viewHome.hidden = next.name !== 'home';
   if (viewCamera) viewCamera.hidden = next.name !== 'camera';
@@ -2390,7 +2747,9 @@ async function applyRoute() {
     await fetchRecent();
     scheduleSnapshots();
   } else if (next.name === 'camera') {
+    applyLayoutMode();
     await enterCamera(next.key, next.t);
+    applyLayoutMode();
   } else if (next.name === 'all') {
     // Search form ready; player opens on demand.
     if (!current) playerPanel.hidden = true;
