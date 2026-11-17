@@ -425,7 +425,7 @@ class ReolinkClient:
         raise DvrUnreachable(f"The camera {self.camera.name} returned HTTP {status}.")
 
     async def open(self, ref: str, range_header: str | None = None,
-                   clamp: bool = False) -> Upstream:
+                   clamp: bool = False, busy_timeout: float | None = None) -> Upstream:
         """Open a recording's bytes, forwarding (a sanitised) Range.
 
         Holds one of this camera's connection slots until Upstream.aclose().
@@ -433,11 +433,13 @@ class ReolinkClient:
         slice, and a reader that stops for IDLE_READ_TIMEOUT_S loses the slot.
         Downloads pass False — a browser's "save as?" prompt may legitimately
         leave the body unread for a while, and a cut-off download is a broken file.
+        External link fetches pass `busy_timeout=30` (UI keeps the 10 s default).
         """
         validate_reolink_ref(ref)
         rng = sanitize_range(range_header, clamp)
+        wait_s = BUSY_TIMEOUT_S if busy_timeout is None else busy_timeout
         try:
-            await asyncio.wait_for(self._sem.acquire(), timeout=BUSY_TIMEOUT_S)
+            await asyncio.wait_for(self._sem.acquire(), timeout=wait_s)
         except asyncio.TimeoutError as exc:
             raise DvrBusy(f"The camera {self.camera.name} is busy. Try again in a moment.") from exc
 

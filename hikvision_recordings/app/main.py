@@ -7,6 +7,7 @@ stores a byte of it.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -19,7 +20,9 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.applications import Starlette
 from starlette.background import BackgroundTask
+from starlette.routing import Route
 
 from .clips import KIND_DVR, KIND_REOLINK, SUB_WINDOW_PAD, Clip, best_overlap
 from .config import Config, load_config_from_file
@@ -35,7 +38,9 @@ from .isapi import (
     RangeNotSatisfiable,
     Recording,
 )
+from .link_cache import LINK_STAGE_PREFIX, SWEEP_INTERVAL_S, LinkStageCache
 from .reolink import ReolinkClient
+from .reolink_flags import EVENT_ORDER
 from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
 from .remux import RemuxError, remux_to_fmp4
 from .thumbnail import (
@@ -44,8 +49,9 @@ from .thumbnail import (
     ThumbnailError,
     thumbnail_from_stream,
 )
+from .token import verify as verify_token
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -58,6 +64,15 @@ INGRESS_PEERS = frozenset({"172.30.32.2", "127.0.0.1"})
 STAGING_DIR = Path(os.environ.get("ADDON_STAGING_DIR", "/tmp"))
 STAGE_PREFIX = "hikclip-"
 STAGE_MAX_AGE_S = 900.0   # a staged file older than this is orphaned; sweep it
+
+# Closed event vocabularies for mint `event=` validation (kind-specific).
+DVR_MINT_EVENTS = frozenset({"motion", "scheduled", "alarm"})
+REOLINK_MINT_EVENTS = frozenset(EVENT_ORDER)
+LINK_BUSY_TIMEOUT_S = 30.0
+CLOSED_CLIP_SLACK_S = 3.0
+MATCH_LOOKBACK_S = 30.0
+MINT_POLL_S = 5.0
+MINT_WAIT_MAX_S = 60
 
 
 def _discard_stage(path: Path) -> None:
@@ -155,6 +170,9 @@ class IngressOnlyMiddleware:
 
     Off when no SUPERVISOR_TOKEN was present (local dev / tests), so TestClient
     and `uvicorn` on a laptop keep working without HA.
+
+    Exact exemption (goldfish §12): POST /internal/mint only — trailing slash and
+    any other method stay under the peer check.
     """
 
     def __init__(self, app, enabled: bool) -> None:
@@ -163,15 +181,18 @@ class IngressOnlyMiddleware:
 
     async def __call__(self, scope, receive, send):
         if self.enabled and scope["type"] == "http":
-            client = scope.get("client")
-            host = client[0] if client else None
-            if host not in INGRESS_PEERS:
-                await Response(
-                    content='{"detail":"Forbidden"}',
-                    status_code=403,
-                    media_type="application/json",
-                )(scope, receive, send)
-                return
+            method = scope.get("method", "")
+            path = scope.get("path", "")
+            if not (method == "POST" and path == "/internal/mint"):
+                client = scope.get("client")
+                host = client[0] if client else None
+                if host not in INGRESS_PEERS:
+                    await Response(
+                        content='{"detail":"Forbidden"}',
+                        status_code=403,
+                        media_type="application/json",
+                    )(scope, receive, send)
+                    return
         await self.app(scope, receive, send)
 
 
@@ -203,16 +224,17 @@ def _safe_filename(channel_name: str, recording: Recording | Clip, extension: st
     return f"{slug}_{stamp}{extension}"
 
 
-def create_app(
+def create_apps(
     config: Config,
     client: IsapiClient | None = None,
     reolink_clients: list | None = None,
     ha_client: HaClient | None = None,
-) -> FastAPI:
-    """Build the app. `client` / `reolink_clients` / `ha_client` are test injectors.
+) -> tuple[FastAPI, Starlette | None]:
+    """Build the ingress app and optional link app from one shared closure.
 
     SUPERVISOR_TOKEN is read once here and removed from the environment so ffmpeg
-    subprocesses (and anything else) cannot inherit it.
+    subprocesses (and anything else) cannot inherit it. Both apps share registry,
+    DVR/Reolink clients, HaClient and the link stage cache.
     """
     token = os.environ.pop("SUPERVISOR_TOKEN", None)
     ha = ha_client if ha_client is not None else HaClient(token)
@@ -256,8 +278,31 @@ def create_app(
     # 2 searches per channel at a device that answers "busy" to far less.
     dvr_search_sem = asyncio.Semaphore(1)
 
+    # Injectable clock for mint matching / link hard-cap tests. Freeze by setting
+    # `_frozen` so both attribute calls and the bound method passed to LinkStageCache
+    # see the same time.
+    class _Clock:
+        def __init__(self) -> None:
+            self._frozen: datetime | None = None
+
+        def freeze(self, when: datetime | None) -> None:
+            self._frozen = when
+
+        def now(self) -> datetime:
+            return self._frozen if self._frozen is not None else datetime.now(timezone.utc)
+
+        def time(self) -> float:
+            if self._frozen is not None:
+                return self._frozen.timestamp()
+            return time.time()
+
+    clock = _Clock()
+    link_cache: LinkStageCache | None = None
+    sweep_task: asyncio.Task | None = None
+
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
+    async def lifespan(app_ref: FastAPI):
+        nonlocal sweep_task
         async def probe(device, label):
             try:
                 await device.probe_clock()
@@ -266,11 +311,40 @@ def create_app(
 
         if dvr is None:
             LOG.info("DVR not configured (dvr_host is blank) — Reolink cameras only")
+        # Leftover link stages from a previous process — zero persistence.
+        if link_cache is not None:
+            link_cache.cleanup_files(STAGING_DIR, older_than=0)
         await asyncio.gather(
             *([probe(dvr, "the DVR")] if dvr is not None else []),
             *(probe(rc, rc.camera.name) for rc in reolinks),
         )
+        if link_cache is not None:
+            async def _periodic_sweep():
+                while True:
+                    try:
+                        await asyncio.sleep(SWEEP_INTERVAL_S)
+                        link_cache.sweep(STAGING_DIR)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("link stage sweep failed: %s", exc)
+
+            sweep_task = asyncio.create_task(_periodic_sweep(), name="link-sweep")
         yield
+        # Stop the link server before closing device clients (serve.py sets this).
+        stop_link = getattr(app_ref.state, "stop_link_server", None)
+        if stop_link is not None:
+            try:
+                await stop_link()
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("link server shutdown: %s", exc)
+        if sweep_task is not None:
+            sweep_task.cancel()
+            try:
+                await sweep_task
+            except asyncio.CancelledError:
+                pass
+            sweep_task = None
         await asyncio.gather(
             *([dvr.aclose()] if dvr is not None else []),
             *(rc.aclose() for rc in reolinks),
@@ -280,6 +354,8 @@ def create_app(
 
     app = FastAPI(title="DVR Recordings", version=VERSION, lifespan=lifespan)
     app.add_middleware(IngressOnlyMiddleware, enabled=ingress_only)
+    app.state.clock = clock
+    app.state.stop_link_server = None
 
     @app.get("/api/channels")
     async def channels():
@@ -372,14 +448,17 @@ def create_app(
         recordings = sorted(found.values(), key=lambda r: r.start)
         return recordings[: config.max_search_results], truncated
 
-    async def _search_dvr_camera(key: str, start_utc: datetime, end_utc: datetime):
+    async def _search_dvr_camera(
+        key: str, start_utc: datetime, end_utc: datetime, *, include_sub: bool = True,
+    ):
         channel = cameras[key]["channel"]
         mains, truncated = await _dvr_search_paged(channel, start_utc, end_utc)
         # One substream search for the whole window, instead of one per play, so SD
         # playback and thumbnails need no extra DVR search. Padded like the per-play
         # lookup. Failure here only costs the pairing — SD then falls back per play.
+        # Mint polling skips the sub search (goldfish §12).
         subs: list[Recording] = []
-        if mains:
+        if mains and include_sub:
             try:
                 subs, _ = await _dvr_search_paged(
                     channel + SUBSTREAM_STREAM_TYPE_OFFSET,
@@ -389,7 +468,7 @@ def create_app(
                 LOG.warning("substream search failed for channel %s (%s)", channel, exc)
         clips = []
         for rec in mains:
-            sub = best_overlap(rec.start, rec.end, subs)
+            sub = best_overlap(rec.start, rec.end, subs) if subs else None
             clips.append(Clip(
                 camera_key=key, kind=KIND_DVR, channel=rec.channel, start=rec.start,
                 end=rec.end, size_bytes=rec.size_bytes, main_ref=rec.playback_uri,
@@ -399,9 +478,11 @@ def create_app(
             ))
         return clips, truncated
 
-    async def _search_camera(key: str, start_utc: datetime, end_utc: datetime):
+    async def _search_camera(
+        key: str, start_utc: datetime, end_utc: datetime, *, include_sub: bool = True,
+    ):
         if cameras[key]["kind"] == KIND_DVR:
-            return await _search_dvr_camera(key, start_utc, end_utc)
+            return await _search_dvr_camera(key, start_utc, end_utc, include_sub=include_sub)
         return await reolink_by_key[key].search(start_utc, end_utc, config.max_search_results)
 
     def _resolve_cameras(requested: list[str]) -> list[str]:
@@ -769,7 +850,9 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
-    async def _stage_clip(recording: Recording, raw: bool) -> Path:
+    async def _stage_clip(
+        recording: Recording, raw: bool, prefix: str = STAGE_PREFIX,
+    ) -> Path:
         """Write the remuxed clip to a RAM-backed temp file and return its path.
 
         WHY THIS EXISTS — iOS, verified live 2026-07-25 (spec section 7):
@@ -785,19 +868,21 @@ def create_app(
         broken, so it is enforced three ways:
           1. The file lives under STAGING_DIR (/tmp), which config.yaml declares as
              `tmpfs: true` — RAM, never the Pi's SD card / disk.
-          2. It is unlinked by a BackgroundTask the moment the response completes.
-          3. _sweep_stale_stages() removes anything a missed cleanup left behind, so
-             a crash mid-response cannot accumulate clips.
+          2. UI stages (hikclip-) are unlinked by a BackgroundTask when the response
+             completes; link stages (hiklink-) live until the link cache evicts them.
+          3. _sweep_stale_stages() removes orphaned hikclip-* only; the link cache
+             sweeps hiklink-* on its own.
         Nothing survives a container restart, and nothing is ever written to the
         add-on's persistent /data.
         """
-        _sweep_stale_stages()
+        if prefix == STAGE_PREFIX:
+            _sweep_stale_stages()
         source = dvr.stream_download(recording.playback_uri)
         pipeline = source if raw else remux_to_fmp4(source)
         iterator = pipeline.__aiter__()
 
         fd, path_str = tempfile.mkstemp(
-            prefix="hikclip-", suffix=".mp4", dir=str(STAGING_DIR)
+            prefix=prefix, suffix=".mp4", dir=str(STAGING_DIR)
         )
         path = Path(path_str)
         written = 0
@@ -946,17 +1031,292 @@ def create_app(
             headers={"Cache-Control": NO_CACHE},
         )
 
+    # ── EXTERNAL PLAYBACK LINKS (v0.7) ────────────────────────────────────────
+    async def _link_stage(clip: Clip, quality: str) -> Path | None:
+        """Stage a DVR clip for the link cache (hiklink-). Reolink needs no staging."""
+        if clip.kind == KIND_REOLINK:
+            return None
+        playback = await _playback_for_quality(clip, quality)
+        return await _stage_clip(playback, raw=False, prefix=LINK_STAGE_PREFIX)
+
+    if config.external_links_ok:
+        link_cache = LinkStageCache(_link_stage, time_fn=clock.time)
+    app.state.link_cache = link_cache
+
+    def _resolve_mint_camera(raw: str) -> str:
+        if raw in cameras:
+            return raw
+        matches = [k for k, cam in cameras.items() if cam["name"] == raw]
+        if len(matches) == 1:
+            return matches[0]
+        raise HTTPException(status_code=400, detail="unknown_camera")
+
+    def _clip_identity(clip: Clip) -> tuple:
+        return (clip.camera_key, clip.start.isoformat(), clip.main_ref)
+
+    async def _find_mint_clip(
+        key: str,
+        since: datetime | None,
+        wait_s: int,
+        event: str | None,
+    ) -> Clip:
+        seen_ends: dict = {}
+        started = clock.now()
+        deadline = started + timedelta(seconds=wait_s)
+
+        while True:
+            now = clock.now()
+            if since is not None:
+                window_start = since - timedelta(seconds=MATCH_LOOKBACK_S)
+                window_end = now
+            else:
+                window_start = now - timedelta(hours=24)
+                window_end = now
+            try:
+                clips, _ = await _search_camera(
+                    key, window_start, window_end, include_sub=False,
+                )
+            except DvrError as exc:
+                raise _http_error(exc) from exc
+
+            matching = list(clips)
+            if since is not None:
+                since_end = since + timedelta(seconds=wait_s)
+                matching = [
+                    c for c in matching
+                    if c.end >= since and c.start <= since_end
+                ]
+            if event is not None:
+                matching = [c for c in matching if event in c.events]
+            matching.sort(key=lambda c: c.start, reverse=True)
+
+            for clip in matching:
+                if clip.end > now - timedelta(seconds=CLOSED_CLIP_SLACK_S):
+                    continue
+                ident = _clip_identity(clip)
+                prev = seen_ends.get(ident)
+                seen_ends[ident] = clip.end
+                if wait_s == 0:
+                    # No polling budget: a sufficiently-old end counts as closed.
+                    return clip
+                if prev is not None and prev == clip.end:
+                    return clip
+
+            if wait_s == 0 or clock.now() >= deadline:
+                raise HTTPException(status_code=404, detail="not_ready")
+
+            sleep_for = min(
+                MINT_POLL_S, max(0.01, (deadline - clock.now()).total_seconds()),
+            )
+            await asyncio.sleep(sleep_for)
+
+    @app.post("/internal/mint")
+    async def mint_link(request: Request):
+        # Bearer check is inside the endpoint for every peer, ingress included.
+        # Never log Authorization or the body.
+        if not config.external_links:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if not config.external_links_ok:
+            raise HTTPException(status_code=503, detail="disabled_misconfigured")
+        auth = request.headers.get("authorization") or ""
+        expected = f"Bearer {config.external_mint_token}"
+        # compare_digest requires equal lengths; mismatch → 401 without raising.
+        auth_b, exp_b = auth.encode("utf-8"), expected.encode("utf-8")
+        if len(auth_b) != len(exp_b) or not hmac.compare_digest(auth_b, exp_b):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="bad_request") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="bad_request")
+
+        camera_raw = body.get("camera")
+        if not isinstance(camera_raw, str) or not camera_raw.strip():
+            raise HTTPException(status_code=400, detail="bad_request")
+        key = _resolve_mint_camera(camera_raw.strip())
+
+        quality = body.get("quality", DEFAULT_QUALITY)
+        if quality not in QUALITIES:
+            raise HTTPException(status_code=400, detail="bad_request")
+
+        wait_s = body.get("wait_s", 0)
+        try:
+            wait_s = int(wait_s)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="bad_request") from exc
+        if wait_s < 0 or wait_s > MINT_WAIT_MAX_S:
+            raise HTTPException(status_code=400, detail="bad_request")
+
+        since = None
+        if "since" in body and body["since"] is not None:
+            if not isinstance(body["since"], str):
+                raise HTTPException(status_code=400, detail="bad_request")
+            since = _parse_utc(body["since"], "since")
+            now = clock.now()
+            if since > now or since < now - timedelta(hours=24):
+                raise HTTPException(status_code=400, detail="bad_request")
+
+        event = body.get("event")
+        if event is not None:
+            if not isinstance(event, str):
+                raise HTTPException(status_code=400, detail="bad_request")
+            allowed = (
+                DVR_MINT_EVENTS if cameras[key]["kind"] == KIND_DVR else REOLINK_MINT_EVENTS
+            )
+            if event not in allowed:
+                raise HTTPException(status_code=400, detail="unsupported_event")
+
+        clip = await _find_mint_clip(key, since, wait_s, event)
+        # Ensure the clip is in the registry so quality resolution can reuse helpers;
+        # link serving itself uses the entry's stored Clip, not the registry.
+        try:
+            registry.put(clip)
+        except InvalidPlaybackUri as exc:
+            raise HTTPException(status_code=400, detail="bad_request") from exc
+
+        needs_stage = clip.kind == KIND_DVR
+        try:
+            entry, token_str, exp = await link_cache.acquire(
+                clip, quality, needs_stage=needs_stage, ttl_s=config.external_link_ttl_s,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 413:
+                raise HTTPException(status_code=413, detail="too_large") from exc
+            if exc.status_code == 503:
+                raise HTTPException(status_code=503, detail="busy") from exc
+            raise
+        except DvrBusy as exc:
+            raise HTTPException(status_code=503, detail="busy") from exc
+        except DvrError as exc:
+            mapped = _http_error(exc)
+            if mapped.status_code == 503:
+                raise HTTPException(status_code=503, detail="busy") from exc
+            raise mapped from exc
+        except Exception as exc:
+            LOG.warning("link staging failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="busy") from exc
+
+        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
+        url = f"{config.external_base_url}/m/{token_str}/clip.mp4"
+        return {
+            "url": url,
+            "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+            "camera": key,
+            "start": clip.start.isoformat().replace("+00:00", "Z"),
+            "end": clip.end.isoformat().replace("+00:00", "Z"),
+            "duration_s": clip.duration_s,
+            "events": list(clip.events),
+            "content_type": "video/mp4",
+        }
+
+    def _link_headers(extra: dict | None = None) -> dict:
+        return {
+            "Content-Type": "video/mp4",
+            "Cache-Control": "no-store",
+            **(extra or {}),
+        }
+
+    async def link_clip(request: Request):
+        token_str = request.path_params["token"]
+        link_cache.sweep()
+        try:
+            payload = verify_token(link_cache.signing_key, token_str)
+        except ValueError:
+            return Response(
+                content='{"detail":"Forbidden"}',
+                status_code=403,
+                media_type="application/json",
+            )
+        if payload["x"] <= int(clock.time()):
+            return Response(
+                content='{"detail":"Forbidden"}',
+                status_code=403,
+                media_type="application/json",
+            )
+        entry = link_cache.get(payload["e"])
+        if entry is None or entry.error is not None:
+            return Response(
+                content='{"detail":"Gone"}',
+                status_code=410,
+                media_type="application/json",
+            )
+        if not entry.ready.is_set():
+            # Staging should have finished at mint; never re-stage on fetch.
+            return Response(
+                content='{"detail":"Gone"}',
+                status_code=410,
+                media_type="application/json",
+            )
+
+        clip = entry.clip
+        if clip.kind == KIND_DVR:
+            if entry.path is None or not entry.path.exists():
+                return Response(
+                    content='{"detail":"Gone"}',
+                    status_code=410,
+                    media_type="application/json",
+                )
+            return FileResponse(
+                entry.path,
+                media_type="video/mp4",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        # Reolink: HEAD from size_bytes; GET proxies Range from the stored Clip.
+        size = (
+            clip.sub_size_bytes
+            if entry.quality == "sd" and clip.sub_ref and clip.sub_size_bytes
+            else clip.size_bytes
+        )
+        if request.method == "HEAD":
+            return Response(
+                status_code=200,
+                headers=_link_headers({
+                    "Content-Length": str(size),
+                    "Accept-Ranges": "bytes",
+                }),
+            )
+        ref = clip.sub_ref if entry.quality == "sd" and clip.sub_ref else clip.main_ref
+        try:
+            upstream = await reolink_by_key[clip.camera_key].open(
+                ref,
+                request.headers.get("range"),
+                clamp=True,
+                busy_timeout=LINK_BUSY_TIMEOUT_S,
+            )
+        except DvrError as exc:
+            mapped = _http_error(exc)
+            return Response(
+                content=f'{{"detail":{mapped.detail!r}}}'
+                if isinstance(mapped.detail, str) else '{"detail":"Bad Gateway"}',
+                status_code=mapped.status_code,
+                media_type="application/json",
+                headers=mapped.headers,
+            )
+        return _reolink_response(upstream)
+
+    link_app: Starlette | None = None
+    if config.external_links_ok:
+        link_app = Starlette(
+            routes=[
+                Route("/m/{token}/clip.mp4", link_clip, methods=["GET"]),
+            ],
+        )
+        link_app.state.link_cache = link_cache
+        link_app.state.clock = clock
+
     # Mounted last so it can never shadow the /api routes above.
     app.mount("/", _CachePolicyStatic(directory=str(WWW_DIR)), name="static")
-    return app
+    return app, link_app
 
 
-def _build_default_app() -> FastAPI | None:
-    try:
-        return create_app(load_config_from_file())
-    except Exception as exc:  # noqa: BLE001 — importing under pytest must not explode
-        LOG.debug("default app not built: %s", exc)
-        return None
-
-
-app = _build_default_app()
+def create_app(
+    config: Config,
+    client: IsapiClient | None = None,
+    reolink_clients: list | None = None,
+    ha_client: HaClient | None = None,
+) -> FastAPI:
+    """Thin wrapper for existing tests — returns the ingress app only."""
+    return create_apps(config, client, reolink_clients, ha_client)[0]
