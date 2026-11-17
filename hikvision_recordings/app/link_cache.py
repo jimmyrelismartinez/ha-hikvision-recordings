@@ -26,7 +26,14 @@ LINK_HARD_CAP_S = 900.0
 LINK_MAX_ENTRIES = 2
 SWEEP_INTERVAL_S = 60.0
 
-StageFn = Callable[[Clip, str], Awaitable[Path | None]]
+# stage_fn(clip, quality, on_path=None) — on_path is called as soon as the
+# tempfile exists so in-flight files count as live during orphan sweeps.
+OnPath = Callable[[Path], None]
+StageFn = Callable[..., Awaitable[Path | None]]
+
+
+class LinkCacheBusy(Exception):
+    """All slots are occupied by in-flight staging; mint should return 503 busy."""
 
 
 @dataclass
@@ -83,14 +90,14 @@ class LinkStageCache:
         for eid in dict.fromkeys(dead):
             self._evict(eid)
         if staging_dir is not None:
-            self.cleanup_files(staging_dir, older_than=0)  # leftover orphans only if not tracked
+            # Never delete every hiklink-* here — that would kill live + in-flight
+            # stages within one sweep interval. Only remove untracked leftovers.
             try:
                 live_paths = {e.path.resolve() for e in self._by_id.values() if e.path}
                 for leftover in staging_dir.glob(f"{LINK_STAGE_PREFIX}*"):
                     try:
                         if leftover.resolve() in live_paths:
                             continue
-                        # Untracked leftover from a crash — remove regardless of age.
                         leftover.unlink(missing_ok=True)
                         LOG.warning("swept orphaned link stage %s", leftover)
                     except OSError:
@@ -126,8 +133,15 @@ class LinkStageCache:
                 LOG.warning("could not remove link stage %s: %s", entry.path, exc)
 
     def _evict_oldest_if_needed(self) -> None:
+        """Free a slot by evicting the oldest *ready* entry. Staging entries stay.
+
+        If every slot is still staging, raise LinkCacheBusy so mint returns 503.
+        """
         while len(self._by_id) >= self._max_entries:
-            oldest_id = min(self._by_id.values(), key=lambda e: e.created).id
+            ready = [e for e in self._by_id.values() if e.ready.is_set()]
+            if not ready:
+                raise LinkCacheBusy("link stage cache busy")
+            oldest_id = min(ready, key=lambda e: e.created).id
             self._evict(oldest_id)
 
     async def acquire(
@@ -150,6 +164,14 @@ class LinkStageCache:
                 if entry.error is not None:
                     # Should not linger; evict and fall through to re-stage.
                     self._evict(entry.id)
+                elif entry.id not in self._by_id:
+                    # Evicted while we waited — do not mint a token for it.
+                    if entry.path is not None:
+                        try:
+                            entry.path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    raise LinkCacheBusy("link stage cache busy")
                 else:
                     exp = self._token_exp(entry, ttl_s)
                     token = mint_token(self._key, entry.id, exp)
@@ -160,6 +182,13 @@ class LinkStageCache:
             entry = await asyncio.shield(existing_task)
             if entry.error is not None:
                 raise entry.error
+            if entry.id not in self._by_id:
+                if entry.path is not None:
+                    try:
+                        entry.path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise LinkCacheBusy("link stage cache busy")
             exp = self._token_exp(entry, ttl_s)
             token = mint_token(self._key, entry.id, exp)
             return entry, token, exp
@@ -191,6 +220,14 @@ class LinkStageCache:
             err = entry.error
             self._evict(entry.id)
             raise err
+        if entry.id not in self._by_id:
+            # Evicted while staging finished — unlink and refuse a token.
+            if entry.path is not None:
+                try:
+                    entry.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise LinkCacheBusy("link stage cache busy")
         exp = self._token_exp(entry, ttl_s)
         token = mint_token(self._key, entry.id, exp)
         return entry, token, exp
@@ -205,7 +242,11 @@ class LinkStageCache:
     async def _run_stage(self, entry: LinkEntry, needs_stage: bool) -> LinkEntry:
         try:
             if needs_stage:
-                path = await self._stage_fn(entry.clip, entry.quality)
+                def _on_path(path: Path) -> None:
+                    # Record before bytes are written so orphan sweeps keep it live.
+                    entry.path = path
+
+                path = await self._stage_fn(entry.clip, entry.quality, _on_path)
                 entry.path = path
             finished = self._time()
             entry.hard_expiry = finished + self._hard_cap_s
@@ -215,6 +256,13 @@ class LinkStageCache:
         finally:
             entry.staging = False
             entry.ready.set()
+            # If we finished after being dropped from the cache, never leave the file.
+            if entry.id not in self._by_id and entry.path is not None:
+                try:
+                    entry.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                entry.path = None
         return entry
 
     def _finish_inflight(self, key: Hashable, task: asyncio.Task) -> None:
