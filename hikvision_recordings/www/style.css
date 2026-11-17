@@ -482,7 +482,9 @@ body.view-all .player-panel { margin-top: 1rem; }
 }
 
 /* ── Wide camera layout (HA Ingress iframe; body.layout-wide only) ───────── */
-.camera-clip-time {
+.camera-clip-time { display: none; }
+body.view-camera.layout-wide .camera-clip-time {
+  display: block;
   color: var(--muted); font-size: 0.85rem; font-variant-numeric: tabular-nums;
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }

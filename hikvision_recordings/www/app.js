@@ -2073,10 +2073,17 @@ function nearestPassingTo(clip) {
 }
 
 function focusedDayFromFilmstrip() {
-  const clip = filmstripCenterClip();
-  if (clip) return localDate(new Date(clip.start));
-  const sep = vtimelineEl && vtimelineEl.querySelector('.fs-day[data-day]');
-  return sep ? sep.dataset.day : localDate(new Date());
+  // The day whose separator is the last one left of the strip centre (cards follow
+  // their separator), so an empty day in the centre still reads as that day.
+  const seps = vtimelineEl ? [...vtimelineEl.querySelectorAll('.fs-day[data-day]')] : [];
+  if (!seps.length) return localDate(new Date());
+  const mid = vtimelineEl.scrollLeft + vtimelineEl.clientWidth / 2;
+  let day = seps[0].dataset.day;
+  for (const sep of seps) {
+    if (sep.offsetLeft <= mid) day = sep.dataset.day;
+    else break;
+  }
+  return day;
 }
 
 function renderDaybar(dayStr) {
@@ -2084,8 +2091,24 @@ function renderDaybar(dayStr) {
   if (!(isWide() && route.name === 'camera')) {
     daybarEl.hidden = true;
     daybarEl.innerHTML = '';
+    renderDaybar.sig = null;
     return;
   }
+  // Rebuild only when what it shows changed: this runs on every strip scroll frame,
+  // and rebuilding mid-press would swallow a segment click.
+  const entry = camState.days.find((d) => d.day === dayStr) || null;
+  const sig = {
+    day: dayStr, filter: camState.filter, entry, key: camState.key,
+    ids: entry ? entry.clips.map((c) => c.id).join(',') : '',
+    minute: Math.floor(Date.now() / 60000), // keeps the "now" line current
+  };
+  const prev = renderDaybar.sig;
+  if (prev && daybarEl.childNodes.length && !daybarEl.hidden
+      && prev.day === sig.day && prev.filter === sig.filter && prev.entry === sig.entry
+      && prev.ids === sig.ids && prev.key === sig.key && prev.minute === sig.minute) {
+    return;
+  }
+  renderDaybar.sig = sig;
   daybarEl.hidden = false;
   daybarEl.innerHTML = '';
   const dayEntry = camState.days.find((d) => d.day === dayStr);
@@ -2112,7 +2135,7 @@ function renderDaybar(dayStr) {
     const s = Date.parse(clip.start);
     const e = Date.parse(clip.end);
     const left = ((s - dayStart.getTime()) / span) * 100;
-    const width = Math.max(3, ((Math.max(e, s + 1000) - s) / span) * 100);
+    const width = ((Math.max(e, s + 1000) - s) / span) * 100; // CSS min-width: 3px
     const seg = document.createElement('button');
     seg.type = 'button';
     seg.className = 'db-seg' + (clipPassesFilter(clip) ? '' : ' dim');
@@ -2472,7 +2495,8 @@ async function enterCamera(key, tIso) {
       || all.find((c) => Math.abs(Date.parse(c.start) - Date.parse(tIso)) < 2000);
     if (!stillOnCamera(gen, key)) return;
     if (current && route.name === 'camera' && String(current.clip.camera_key) === String(key)) {
-      // Already opened from Recent tap — just scroll.
+      // Already opened from Recent tap — just scroll (and show its time in the toolbar).
+      setCameraClipTime(current.clip);
       const el = vtimelineEl && vtimelineEl.querySelector(`[data-clip-key="${cssEsc(clipKey(current.clip))}"]`);
       scrollTimelineTo(el, { align: 'center' });
     } else if (match && route.name === 'camera' && route.key === key) {
@@ -2652,7 +2676,7 @@ if (vtimelineEl) {
 
 function applyLayoutMode() {
   // Ignore MQ flips while the video is fullscreen; re-check on fullscreenchange.
-  if (document.fullscreenElement) return;
+  if (document.fullscreenElement || document.webkitFullscreenElement) return;
   const want = route.name === 'camera' && isWide();
   const had = document.body.classList.contains('layout-wide');
   document.body.classList.toggle('layout-wide', want);
@@ -2684,6 +2708,7 @@ if (WIDE_MQ.addEventListener) {
   WIDE_MQ.addListener(() => applyLayoutMode());
 }
 document.addEventListener('fullscreenchange', () => applyLayoutMode());
+document.addEventListener('webkitfullscreenchange', () => applyLayoutMode());
 
 /* ── Routing ──────────────────────────────────────────────────────────────── */
 function parseHash() {
