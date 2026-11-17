@@ -64,11 +64,11 @@ def test_length_cap():
 
 
 def test_hmac_checked_before_json():
-    """Garbage payload with a valid-looking structure still fails the HMAC first."""
+    """Wrong HMAC over a non-JSON payload must fail as bad_sig before JSON parse."""
     key = new_signing_key()
-    garbage = base64.urlsafe_b64encode(b"not-json").decode().rstrip("=")
-    sig = base64.urlsafe_b64encode(
-        hmac.new(key, b"not-json", hashlib.sha256).digest()
+    garbage = base64.urlsafe_b64encode(b"not-json{{{").decode().rstrip("=")
+    wrong_sig = base64.urlsafe_b64encode(
+        hmac.new(key, b"different-bytes", hashlib.sha256).digest()
     ).decode().rstrip("=")
-    with pytest.raises(ValueError):
-        verify(key, f"{garbage}.{sig}")
+    with pytest.raises(ValueError, match="bad_sig"):
+        verify(key, f"{garbage}.{wrong_sig}")

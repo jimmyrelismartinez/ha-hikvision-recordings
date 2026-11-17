@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -38,7 +40,7 @@ from .isapi import (
     RangeNotSatisfiable,
     Recording,
 )
-from .link_cache import LINK_STAGE_PREFIX, SWEEP_INTERVAL_S, LinkStageCache
+from .link_cache import LINK_STAGE_PREFIX, SWEEP_INTERVAL_S, LinkCacheBusy, LinkStageCache
 from .reolink import ReolinkClient
 from .reolink_flags import EVENT_ORDER
 from .registry import ClipExpired, ClipRegistry, InvalidPlaybackUri
@@ -73,6 +75,10 @@ CLOSED_CLIP_SLACK_S = 3.0
 MATCH_LOOKBACK_S = 30.0
 MINT_POLL_S = 5.0
 MINT_WAIT_MAX_S = 60
+# Without `since`, prefer a short trailing window so paged DVR search (oldest-first,
+# capped at max_search_results) still sees the newest clips on busy channels.
+MINT_RECENT_HOURS = 2
+MINT_FALLBACK_HOURS = 24
 
 
 def _discard_stage(path: Path) -> None:
@@ -851,7 +857,10 @@ def create_apps(
         )
 
     async def _stage_clip(
-        recording: Recording, raw: bool, prefix: str = STAGE_PREFIX,
+        recording: Recording,
+        raw: bool,
+        prefix: str = STAGE_PREFIX,
+        on_path: Callable[[Path], None] | None = None,
     ) -> Path:
         """Write the remuxed clip to a RAM-backed temp file and return its path.
 
@@ -885,6 +894,8 @@ def create_apps(
             prefix=prefix, suffix=".mp4", dir=str(STAGING_DIR)
         )
         path = Path(path_str)
+        if on_path is not None:
+            on_path(path)
         written = 0
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -1032,12 +1043,18 @@ def create_apps(
         )
 
     # ── EXTERNAL PLAYBACK LINKS (v0.7) ────────────────────────────────────────
-    async def _link_stage(clip: Clip, quality: str) -> Path | None:
+    async def _link_stage(
+        clip: Clip,
+        quality: str,
+        on_path: Callable[[Path], None] | None = None,
+    ) -> Path | None:
         """Stage a DVR clip for the link cache (hiklink-). Reolink needs no staging."""
         if clip.kind == KIND_REOLINK:
             return None
         playback = await _playback_for_quality(clip, quality)
-        return await _stage_clip(playback, raw=False, prefix=LINK_STAGE_PREFIX)
+        return await _stage_clip(
+            playback, raw=False, prefix=LINK_STAGE_PREFIX, on_path=on_path,
+        )
 
     if config.external_links_ok:
         link_cache = LinkStageCache(_link_stage, time_fn=clock.time)
@@ -1064,35 +1081,52 @@ def create_apps(
         started = clock.now()
         deadline = started + timedelta(seconds=wait_s)
 
-        while True:
-            now = clock.now()
-            if since is not None:
-                window_start = since - timedelta(seconds=MATCH_LOOKBACK_S)
-                window_end = now
-            else:
-                window_start = now - timedelta(hours=24)
-                window_end = now
+        async def _search_window(window_start: datetime, window_end: datetime) -> list[Clip]:
             try:
                 clips, _ = await _search_camera(
                     key, window_start, window_end, include_sub=False,
                 )
+            except DvrBusy as exc:
+                raise HTTPException(status_code=503, detail="busy") from exc
             except DvrError as exc:
-                raise _http_error(exc) from exc
+                raise HTTPException(status_code=503, detail="busy") from exc
+            return list(clips)
 
-            matching = list(clips)
+        while True:
+            now = clock.now()
             if since is not None:
-                since_end = since + timedelta(seconds=wait_s)
-                matching = [
-                    c for c in matching
-                    if c.end >= since and c.start <= since_end
+                windows = [(since - timedelta(seconds=MATCH_LOOKBACK_S), now)]
+            else:
+                # Trailing 2 h first so max_search_results truncation keeps the
+                # newest clips; widen to 24 h only when that window is empty.
+                windows = [
+                    (now - timedelta(hours=MINT_RECENT_HOURS), now),
+                    (now - timedelta(hours=MINT_FALLBACK_HOURS), now),
                 ]
-            if event is not None:
-                matching = [c for c in matching if event in c.events]
-            matching.sort(key=lambda c: c.start, reverse=True)
 
-            for clip in matching:
-                if clip.end > now - timedelta(seconds=CLOSED_CLIP_SLACK_S):
-                    continue
+            matching: list[Clip] = []
+            for window_start, window_end in windows:
+                clips = await _search_window(window_start, window_end)
+                matching = list(clips)
+                if since is not None:
+                    since_end = since + timedelta(seconds=wait_s)
+                    matching = [
+                        c for c in matching
+                        if c.end >= since and c.start <= since_end
+                    ]
+                if event is not None:
+                    matching = [c for c in matching if event in c.events]
+                if matching:
+                    break
+
+            matching.sort(key=lambda c: c.start, reverse=True)
+            closed_enough = [
+                c for c in matching
+                if c.end <= now - timedelta(seconds=CLOSED_CLIP_SLACK_S)
+            ]
+
+            confirmed: list[Clip] = []
+            for clip in closed_enough:
                 ident = _clip_identity(clip)
                 prev = seen_ends.get(ident)
                 seen_ends[ident] = clip.end
@@ -1100,9 +1134,18 @@ def create_apps(
                     # No polling budget: a sufficiently-old end counts as closed.
                     return clip
                 if prev is not None and prev == clip.end:
-                    return clip
+                    confirmed.append(clip)
 
-            if wait_s == 0 or clock.now() >= deadline:
+            if confirmed:
+                newest_closed = closed_enough[0]
+                # Prefer the newest candidate once it is stable across two polls.
+                if confirmed[0] is newest_closed or _clip_identity(confirmed[0]) == _clip_identity(newest_closed):
+                    return confirmed[0]
+                # Newest not yet confirmed — keep polling unless we are at the deadline,
+                # then fall back to an older closed clip.
+                if clock.now() >= deadline:
+                    return confirmed[0]
+            elif wait_s == 0 or clock.now() >= deadline:
                 raise HTTPException(status_code=404, detail="not_ready")
 
             sleep_for = min(
@@ -1153,7 +1196,10 @@ def create_apps(
         if "since" in body and body["since"] is not None:
             if not isinstance(body["since"], str):
                 raise HTTPException(status_code=400, detail="bad_request")
-            since = _parse_utc(body["since"], "since")
+            try:
+                since = _parse_utc(body["since"], "since")
+            except HTTPException as exc:
+                raise HTTPException(status_code=400, detail="bad_request") from exc
             now = clock.now()
             if since > now or since < now - timedelta(hours=24):
                 raise HTTPException(status_code=400, detail="bad_request")
@@ -1169,10 +1215,10 @@ def create_apps(
                 raise HTTPException(status_code=400, detail="unsupported_event")
 
         clip = await _find_mint_clip(key, since, wait_s, event)
-        # Ensure the clip is in the registry so quality resolution can reuse helpers;
-        # link serving itself uses the entry's stored Clip, not the registry.
+        # Validate the main ref without mutating the UI registry (a put with
+        # sub_ref=None would overwrite an earlier search pairing).
         try:
-            registry.put(clip)
+            registry.validate_ref(clip.kind, clip.main_ref)
         except InvalidPlaybackUri as exc:
             raise HTTPException(status_code=400, detail="bad_request") from exc
 
@@ -1184,16 +1230,17 @@ def create_apps(
         except HTTPException as exc:
             if exc.status_code == 413:
                 raise HTTPException(status_code=413, detail="too_large") from exc
-            if exc.status_code == 503:
-                raise HTTPException(status_code=503, detail="busy") from exc
-            raise
+            # Staging failures (RemuxError→500, empty clip→502, DvrBusy→503, …)
+            # all map to the §12 mint table: busy. Never leak exception text.
+            raise HTTPException(status_code=503, detail="busy") from exc
+        except LinkCacheBusy as exc:
+            raise HTTPException(status_code=503, detail="busy") from exc
         except DvrBusy as exc:
             raise HTTPException(status_code=503, detail="busy") from exc
         except DvrError as exc:
-            mapped = _http_error(exc)
-            if mapped.status_code == 503:
-                raise HTTPException(status_code=503, detail="busy") from exc
-            raise mapped from exc
+            raise HTTPException(status_code=503, detail="busy") from exc
+        except RemuxError as exc:
+            raise HTTPException(status_code=503, detail="busy") from exc
         except Exception as exc:
             LOG.warning("link staging failed: %s", type(exc).__name__)
             raise HTTPException(status_code=503, detail="busy") from exc
@@ -1252,17 +1299,35 @@ def create_apps(
 
         clip = entry.clip
         if clip.kind == KIND_DVR:
-            if entry.path is None or not entry.path.exists():
+            if entry.path is None:
                 return Response(
                     content='{"detail":"Gone"}',
                     status_code=410,
                     media_type="application/json",
                 )
-            return FileResponse(
-                entry.path,
-                media_type="video/mp4",
-                headers={"Cache-Control": "no-store"},
-            )
+            # Race: path may vanish between exists() and FileResponse's stat.
+            # Prefer 410 over a 500 from a missing file.
+            try:
+                stat_result = entry.path.stat()
+            except OSError:
+                return Response(
+                    content='{"detail":"Gone"}',
+                    status_code=410,
+                    media_type="application/json",
+                )
+            try:
+                return FileResponse(
+                    entry.path,
+                    media_type="video/mp4",
+                    headers={"Cache-Control": "no-store"},
+                    stat_result=stat_result,
+                )
+            except OSError:
+                return Response(
+                    content='{"detail":"Gone"}',
+                    status_code=410,
+                    media_type="application/json",
+                )
 
         # Reolink: HEAD from size_bytes; GET proxies Range from the stored Clip.
         size = (
@@ -1288,9 +1353,9 @@ def create_apps(
             )
         except DvrError as exc:
             mapped = _http_error(exc)
+            detail = "busy" if mapped.status_code == 503 else "gone"
             return Response(
-                content=f'{{"detail":{mapped.detail!r}}}'
-                if isinstance(mapped.detail, str) else '{"detail":"Bad Gateway"}',
+                content=json.dumps({"detail": detail}),
                 status_code=mapped.status_code,
                 media_type="application/json",
                 headers=mapped.headers,

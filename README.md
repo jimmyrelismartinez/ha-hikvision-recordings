@@ -144,6 +144,8 @@ script:
         data:
           since: "{{ now().isoformat() }}"
         response_variable: minted
+      - condition: template
+        value_template: "{{ minted.status == 200 }}"
       - action: media_player.play_media
         target:
           entity_id: media_player.living_room_frame
@@ -153,7 +155,9 @@ script:
 ```
 
 Use `response_variable` so the script can read the absolute `url` from the JSON body.
-Cap `wait_s` at 60; `timeout: 120` covers wait plus staging.
+Cap `wait_s` at 60; `timeout: 120` covers wait plus staging. A mint that returns
+404 `not_ready` (no matching closed clip yet) fails the template condition so the
+frame is not handed an empty URL.
 
 ### Browsing and playback (v0.3.0)
 
