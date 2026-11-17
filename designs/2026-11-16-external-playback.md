@@ -132,3 +132,47 @@ would re-pull and re-remux the clip from the DVR and compete for
 
 ## 10. Later (not this issue)
 HA media source (clips in HA's media browser / any media player).
+
+## 11. Decisions (Fable advisor, 2026-11-16) — override earlier sections
+
+Context from the frame project:
+- The frame is now `media_player.pronext_frame` (HA dlna_dmr). It uses an ExoPlayer
+  bridge and plays HTTP MP4/fMP4/TS, HLS and RTSP; `play_media` with a URL works.
+- The frame shares an L2 segment with an HA host interface.
+- The frame already fetches from HA's 9123 with valid TLS (`camera.play_stream` works).
+
+1. **Port: separate link app on 8100, `ports: {"8100/tcp": null}` (unmapped by
+   default).** Not 8099: publishing 8099 would put the whole ingress app on the
+   LAN behind only a peer-IP check. The only way to serve via HA's 9123 is a media
+   source integration (later) or writing files to `/media`, which breaks zero
+   persistence. Verify the `null` = disabled semantics against the Supervisor docs.
+2. **Mint secret: a `password` option mirrored in `secrets.yaml`, minimum 24
+   characters.** `hassio.addon_stdin` (Supervisor-authenticated) was rejected: it is
+   one-way (no URL or error back to the automation) and would couple the add-on to
+   one player.
+3. **Snapshots: out of scope.** Use the camera's `entity_picture`
+   (`/api/camera_proxy/...?token=`), resolved at call time and prefixed with HA's
+   external URL. The README shows how. Delete `kind: snapshot` from §2/§5.
+4. **Motion → clip: server-side wait (`since` + `wait_s`).** Live view is already
+   `camera.play_stream`; this feature is "replay what just happened". Risk to
+   measure on-device: if the DVR records continuously, no clip may close within
+   90 s; a time-window clip can come later (`playbackURI` carries start/end).
+
+Changes these make to the draft:
+- **HA flow:** `rest_command` mint → `media_player.play_media` on
+  `media_player.pronext_frame` with the URL and `media_content_type: video/mp4`.
+  `frame_play_url` is only a fallback.
+- **No firewall rule is needed** for the frame: same segment. Document that
+  Supervisor publishes the port on **all** host interfaces.
+- **`external_base_url` is required** when links are on (plain
+  `http://<HA host>:8100`; the link port has no TLS). Mint always returns an
+  absolute URL.
+- **Path ends in `.mp4`** (`/m/{token}/clip.mp4`), with `Content-Type: video/mp4`.
+  DLNA renderers infer the type from the extension.
+- **Token exposure:** the URL lands in the player's `media_content_id` and so in
+  recorder history. That is acceptable only because of the short TTL and the
+  in-memory key; the docs say so.
+- **Stage budget:** a clip larger than `max_stage_mb` fails at mint with a clear
+  error. Keep at most 2 live link-stage entries and evict the oldest.
+- **HEVC:** the on-device step confirms that an HEVC channel's fMP4 plays on the
+  frame.
