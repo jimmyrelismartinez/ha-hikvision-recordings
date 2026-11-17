@@ -79,6 +79,82 @@ no-page-scroll layout: video fills the space above a bottom dock with the filter
 a 24-hour day bar, and a horizontal thumbnail filmstrip (oldest left, newest right).
 Portrait phones and the home / All recordings pages keep the previous layout.
 
+### External playback links (v0.7.0)
+
+Short-lived signed clip URLs for another LAN device (for example a digital frame
+`media_player`). Snapshots are **not** minted here — use the camera entity's
+`entity_picture` (HA's rotating token on `/api/camera_proxy/...`) prefixed with your
+HA external URL.
+
+**Enable**
+
+1. Set a long random `external_mint_token` (≥ 24 characters, **without** the
+   `Bearer ` prefix) in the add-on options, and put `Bearer <same-token>` in
+   Home Assistant as `!secret dvr_mint_token` (or similar) for the rest_command header.
+2. Set `external_base_url` to the absolute origin players will call, e.g.
+   `http://192.0.2.10:8100` (http/https, no path). Trailing slashes are stripped.
+3. Turn `external_links: true`. Optionally raise `external_link_ttl_s` (60–900,
+   default 300).
+4. In the add-on **Network** tab, map host port **8100** (it ships unmapped:
+   `ports: {"8100/tcp": null}`). Supervisor publishes a mapped port on **all** host
+   interfaces. Allow the player → HA host:`<port>` if your network filters that path;
+   same-segment players often need no extra firewall rule.
+5. Restart the add-on. Invalid link options are logged as errors, leave the Ingress UI
+   working, keep the link listener off, and make `POST /internal/mint` return 503.
+
+Even when unmapped on the host, container port 8100 is reachable from other add-ons on
+the hassio network — fetches stay token-gated.
+
+**Behaviour**
+
+- Mint (`POST http://<addon-hostname>:8099/internal/mint`) is bearer-authenticated and
+  is the only 8099 path exempt from the ingress peer check. The add-on hostname is
+  under `ha addons info` → `hostname`.
+- The link listener serves only `GET/HEAD /m/{token}/clip.mp4` (fMP4 / MP4,
+  `Content-Type: video/mp4`, Range 206). Everything else on that port is 404.
+- Tokens are HMAC-signed with an in-memory key (restart invalidates every link),
+  reusable until TTL, and bound to a staged entry (not the registry clip id). A link
+  that expires mid-playback will fail later Range requests.
+- The minted URL will appear in the player's `media_content_id` and therefore in
+  recorder history — acceptable only because of the short TTL and the in-memory key.
+- Worst-case RAM for link staging is about `2 × max_stage_mb` (at most two live
+  link-stage entries) on top of ordinary UI stages.
+
+**Home Assistant example**
+
+```yaml
+# secrets.yaml  (include the Bearer prefix)
+dvr_mint_token: "Bearer replace-with-24+-char-secret"
+
+# configuration.yaml
+rest_command:
+  dvr_mint_clip:
+    url: "http://<addon-hostname>:8099/internal/mint"
+    method: POST
+    headers:
+      Authorization: !secret dvr_mint_token
+      Content-Type: application/json
+    payload: '{"camera":"dvr-101","since":"{{ since }}","wait_s":60,"event":"motion"}'
+    timeout: 120
+
+script:
+  play_driveway_on_frame:
+    sequence:
+      - action: rest_command.dvr_mint_clip
+        data:
+          since: "{{ now().isoformat() }}"
+        response_variable: minted
+      - action: media_player.play_media
+        target:
+          entity_id: media_player.living_room_frame
+        data:
+          media_content_id: "{{ minted['content']['url'] }}"
+          media_content_type: video/mp4
+```
+
+Use `response_variable` so the script can read the absolute `url` from the JSON body.
+Cap `wait_s` at 60; `timeout: 120` covers wait plus staging.
+
 ### Browsing and playback (v0.3.0)
 
 - **Cameras:** "All" plus one chip per camera. Pick any mix; picking every camera
