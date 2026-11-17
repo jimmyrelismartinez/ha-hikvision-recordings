@@ -24,7 +24,7 @@ MAIN_REF = "Mp4Record/2026-11-14/RecM0A_20261114_120000_120030_0_9B28C080000000_
 SUB_REF = "Mp4Record/2026-11-14/RecS0A_20261114_120000_120030_0_5514C080000000_65A424.mp4"
 
 DVR_OPTIONS = {
-    "dvr_host": "10.10.11.56",
+    "dvr_host": "192.0.2.56",
     "dvr_username": "u",
     "dvr_password": "p",
     "channels": [{"id": 101, "name": "Driveway"}],
@@ -37,7 +37,7 @@ def rec(minute: int, channel: int = 101) -> Recording:
     start = T0 + timedelta(minutes=minute)
     return Recording(
         channel=channel, start=start, end=start + timedelta(seconds=30), size_bytes=1000,
-        playback_uri=f"rtsp://10.10.11.56/Streaming/tracks/{channel}/?starttime={minute}&size=1000",
+        playback_uri=f"rtsp://192.0.2.56/Streaming/tracks/{channel}/?starttime={minute}&size=1000",
     )
 
 

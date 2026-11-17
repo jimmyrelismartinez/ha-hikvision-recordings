@@ -11,7 +11,7 @@ your browser.
 1. Settings → Add-ons → Add-on Store → ⋮ → Repositories
 2. Add `https://github.com/jimmyrelismartinez/ha-hikvision-recordings`
 3. Install **DVR Recordings**, open Configuration, fill in:
-   - `dvr_host` — DVR IP (e.g. `10.10.11.56`). Must match the IP/hostname the DVR reports in its own playback URIs. For Hikvision, this is typically the DVR's IP address, not a hostname.
+   - `dvr_host` — DVR IP (e.g. `192.0.2.56`). Must match the IP/hostname the DVR reports in its own playback URIs. For Hikvision, this is typically the DVR's IP address, not a hostname.
    - `dvr_username` / `dvr_password` — a DVR account with playback rights
    - `channels` — one row per camera: `id` (e.g. `101`) and `name` (e.g. `Driveway`);
      optional `ha_camera` (e.g. `camera.driveway`) to link a Home Assistant camera
@@ -517,9 +517,8 @@ output to the staged path, valid MP4.
   `amd64-base-python` (verified: manifest pulls HTTP 200 on all three, 2026-07-25). Matches
   the dev `.venv` Python (3.12.3) exactly — no dev/prod runtime skew. Task 10's `build.yaml`
   may use this single tag string for all three arches.
-- Install target: HAOS core at https://10.10.10.9:9123; jimmy-ha on :8124 is a HA Container
-  with no add-on store (verified by probe 2026-07-24: `/api/hassio/*` → 404 on :8124; HA
-  frontend + 401 on `/api/` at :9123).
+- Install target: an HAOS / Supervised install (the add-on store is required; a plain
+  HA Container has no add-on store).
 - Slug collision check + arch confirmation on the :9123 instance is PENDING — owner to verify
   in the HA UI before install (requires human login; not checked programmatically).
 - Frontend (`hikvision_recordings/www/`) is a plain single-page app served by the FastAPI

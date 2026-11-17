@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # 2026-07-27, DO NOT "UPGRADE" THIS TO core-mt:
 # core-mt needs SharedArrayBuffer, which needs the page to be cross-origin
 # isolated. Under HA Ingress that is IMPOSSIBLE: isolation is inherited top-down
-# and HA's own frontend sends neither COOP nor COEP (checked live on 10.10.10.9),
+# and HA's own frontend sends neither COOP nor COEP (checked live on a HAOS install),
 # so no header this add-on sets can make crossOriginIsolated true inside the
 # panel iframe. The ST core needs none of that, and for `-c copy` it is not even
 # slower — remuxing a real 3.7 MB DVR clip measured 365 ms with SharedArrayBuffer

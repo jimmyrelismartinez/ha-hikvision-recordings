@@ -137,7 +137,7 @@ HA media source (clips in HA's media browser / any media player).
 ## 11. Decisions (Fable advisor, 2026-11-16) — override earlier sections
 
 Context from the frame project:
-- The frame is now `media_player.pronext_frame` (HA dlna_dmr). It uses an ExoPlayer
+- The frame is now `media_player.living_room_frame` (HA dlna_dmr). It uses an ExoPlayer
   bridge and plays HTTP MP4/fMP4/TS, HLS and RTSP; `play_media` with a URL works.
 - The frame shares an L2 segment with an HA host interface.
 - The frame already fetches from HA's 9123 with valid TLS (`camera.play_stream` works).
@@ -161,7 +161,7 @@ Context from the frame project:
 
 Changes these make to the draft:
 - **HA flow:** `rest_command` mint → `media_player.play_media` on
-  `media_player.pronext_frame` with the URL and `media_content_type: video/mp4`.
+  `media_player.living_room_frame` with the URL and `media_content_type: video/mp4`.
   `frame_play_url` is only a fallback.
 - **No firewall rule is needed** for the frame: same segment. Document that
   Supervisor publishes the port on **all** host interfaces.

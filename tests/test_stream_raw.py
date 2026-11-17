@@ -39,14 +39,14 @@ MAIN_CLIP = Recording(
     start=MAIN_START,
     end=MAIN_END,
     size_bytes=17_800_000,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260725T211400Z&size=17800000",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260725T211400Z&size=17800000",
 )
 SUB_CLIP = Recording(
     channel=102,
     start=MAIN_START + timedelta(seconds=2),
     end=MAIN_END - timedelta(seconds=1),
     size_bytes=10_500_000,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/102/?starttime=20260725T211402Z&size=10500000",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/102/?starttime=20260725T211402Z&size=10500000",
 )
 
 # 'IMKH' is the real Hikvision MPEG-PS magic, so these double as a check that the
@@ -55,8 +55,8 @@ MAIN_PAYLOAD = b"IMKH" + b"m" * 4000
 SUB_PAYLOAD = b"IMKH" + b"s" * 2000
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}],
 }

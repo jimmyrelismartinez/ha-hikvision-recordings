@@ -37,12 +37,12 @@ RECORDING = Recording(
     start=datetime(2026, 7, 25, 16, 48, 5, tzinfo=timezone.utc),
     end=datetime(2026, 7, 25, 16, 48, 42, tzinfo=timezone.utc),
     size_bytes=19_761_375,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260725T114805Z&size=19761375",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260725T114805Z&size=19761375",
 )
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}],
 }

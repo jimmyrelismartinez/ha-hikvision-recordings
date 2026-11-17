@@ -15,8 +15,8 @@ from hikvision_recordings.app.isapi import (
 from hikvision_recordings.app.main import create_app
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}, {"id": 401, "name": "ENTRYWAY"}],
     "max_results": 2,
@@ -27,7 +27,7 @@ RECORDING = Recording(
     start=datetime(2026, 7, 24, 18, 20, 29, tzinfo=timezone.utc),
     end=datetime(2026, 7, 24, 18, 21, 42, tzinfo=timezone.utc),
     size_bytes=32947084,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260724T132029Z&size=32947084",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260724T132029Z&size=32947084",
 )
 
 
@@ -127,7 +127,7 @@ def test_end_before_start_is_rejected():
 @pytest.mark.parametrize(
     "error,status,fragment",
     [
-        (DvrUnreachable("Can't reach the DVR at 10.10.11.56."), 502, "reach the DVR"),
+        (DvrUnreachable("Can't reach the DVR at 192.0.2.56."), 502, "reach the DVR"),
         (DvrAuthError("The DVR rejected the username or password."), 401, "rejected the username"),
         (DvrBusy("DVR is busy serving another stream."), 503, "busy"),
     ],
@@ -149,7 +149,7 @@ def test_expired_clip_id_returns_410():
 
 def test_stream_failure_before_first_byte_is_a_real_error_status():
     """A dead DVR must produce 502, not a 200 with an empty body."""
-    fake = FakeClient(stream_error=DvrUnreachable("Can't reach the DVR at 10.10.11.56."))
+    fake = FakeClient(stream_error=DvrUnreachable("Can't reach the DVR at 192.0.2.56."))
     with client_for(fake) as client:
         clips = client.get(
             "/api/recordings",
@@ -194,7 +194,7 @@ def test_recordings_are_ordered_newest_first():
         start=datetime(2026, 7, 25, 9, 0, 0, tzinfo=timezone.utc),
         end=datetime(2026, 7, 25, 9, 1, 0, tzinfo=timezone.utc),
         size_bytes=1000,
-        playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260725T090000Z&size=1000",
+        playback_uri="rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260725T090000Z&size=1000",
     )
     fake = FakeClient(recordings=[older, newer])
     with client_for(fake, max_results=40) as client:

@@ -45,7 +45,7 @@ def test_parse_returns_recordings(search_ok):
     assert first.start == datetime(2026, 7, 24, 13, 20, 29, tzinfo=timezone.utc)
     assert first.duration_s == 73
     assert first.size_bytes == 32947084
-    assert first.playback_uri.startswith("rtsp://10.10.11.56/Streaming/tracks/101/")
+    assert first.playback_uri.startswith("rtsp://192.0.2.56/Streaming/tracks/101/")
     assert "&amp;" not in first.playback_uri, "XML entities must be decoded"
 
 

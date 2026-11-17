@@ -37,12 +37,12 @@ RECORDING = Recording(
     start=datetime(2026, 7, 25, 16, 48, 5, tzinfo=timezone.utc),
     end=datetime(2026, 7, 25, 16, 48, 42, tzinfo=timezone.utc),
     size_bytes=len(PAYLOAD),
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260725T114805Z&size=51200",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260725T114805Z&size=51200",
 )
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}],
 }
@@ -136,7 +136,7 @@ def test_staged_file_is_deleted_after_the_response_completes(staging, monkeypatc
 
 def test_staged_file_is_deleted_when_the_dvr_fails_midway(staging, monkeypatch):
     monkeypatch.setattr(main_module, "remux_to_fmp4", lambda src: src)
-    fake = FakeClient(stream_error=DvrUnreachable("Can't reach the DVR at 10.10.11.56."))
+    fake = FakeClient(stream_error=DvrUnreachable("Can't reach the DVR at 192.0.2.56."))
     with _client(fake) as client:
         response = client.get(f"/api/stream/{_clip_id(client)}")
     assert response.status_code == 502

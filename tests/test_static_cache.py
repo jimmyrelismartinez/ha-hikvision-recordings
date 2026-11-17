@@ -23,8 +23,8 @@ from hikvision_recordings.app.config import load_config
 from hikvision_recordings.app.main import WWW_DIR, create_app
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}],
 }

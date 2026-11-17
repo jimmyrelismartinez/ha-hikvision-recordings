@@ -51,14 +51,14 @@ SEARCH_OK = """<?xml version="1.0" encoding="UTF-8"?>
 <trackID>301</trackID>
 <timeSpan><startTime>2026-07-25T11:28:55Z</startTime><endTime>2026-07-25T11:29:55Z</endTime></timeSpan>
 <mediaSegmentDescriptor>
-<playbackURI>rtsp://10.10.11.56/Streaming/tracks/301/?starttime=20260725T112855Z&amp;endtime=20260725T112955Z&amp;name=x&amp;size=63294704</playbackURI>
+<playbackURI>rtsp://192.0.2.56/Streaming/tracks/301/?starttime=20260725T112855Z&amp;endtime=20260725T112955Z&amp;name=x&amp;size=63294704</playbackURI>
 </mediaSegmentDescriptor>
 </searchMatchItem></matchList>
 </CMSearchResult>"""
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 301, "name": "left alley"}],
 }
@@ -69,10 +69,10 @@ def make_client(**overrides) -> IsapiClient:
 
 
 def _mock_time_and_search():
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(200, text=DEVICE_TIME_XML)
     )
-    return respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/search").mock(
+    return respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/search").mock(
         return_value=httpx.Response(200, text=SEARCH_OK)
     )
 
@@ -172,7 +172,7 @@ async def test_declared_mode_still_available_as_an_escape_hatch():
 @respx.mock
 async def test_a_utc_honest_firmware_self_detects_to_no_shift():
     """`auto` is safe for other hardware: a device whose face equals UTC measures ~0."""
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(
             200,
             text=DEVICE_TIME_XML.replace(
@@ -191,7 +191,7 @@ async def test_a_utc_honest_firmware_self_detects_to_no_shift():
 @respx.mock
 async def test_unreadable_clock_reuses_the_last_measurement_instead_of_guessing():
     """Assuming the HOST's zone is what caused the original bug — never do that again."""
-    time_route = respx.get("http://10.10.11.56:80/ISAPI/System/time")
+    time_route = respx.get("http://192.0.2.56:80/ISAPI/System/time")
     time_route.mock(return_value=httpx.Response(200, text=DEVICE_TIME_XML))
     client = make_client(dvr_time_mode="auto")
     await client.probe_clock(now_utc=NOW_UTC)

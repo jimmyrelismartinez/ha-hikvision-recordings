@@ -20,14 +20,14 @@ SEARCH_OK = """<?xml version="1.0" encoding="UTF-8"?>
 <trackID>101</trackID>
 <timeSpan><startTime>2026-07-24T13:20:29Z</startTime><endTime>2026-07-24T13:21:42Z</endTime></timeSpan>
 <mediaSegmentDescriptor><contentType>video</contentType><codecType>H.264-BP</codecType>
-<playbackURI>rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260724T132029Z&amp;endtime=20260724T132142Z&amp;name=00000000002000001&amp;size=32947084</playbackURI>
+<playbackURI>rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260724T132029Z&amp;endtime=20260724T132142Z&amp;name=00000000002000001&amp;size=32947084</playbackURI>
 </mediaSegmentDescriptor>
 </searchMatchItem>
 <searchMatchItem>
 <trackID>101</trackID>
 <timeSpan><startTime>2026-07-24T13:25:00Z</startTime><endTime>2026-07-24T13:26:00Z</endTime></timeSpan>
 <mediaSegmentDescriptor>
-<playbackURI>rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260724T132500Z&amp;endtime=20260724T132600Z&amp;name=00000000002000002&amp;size=1048576</playbackURI>
+<playbackURI>rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260724T132500Z&amp;endtime=20260724T132600Z&amp;name=00000000002000002&amp;size=1048576</playbackURI>
 </mediaSegmentDescriptor>
 </searchMatchItem>
 </matchList>
