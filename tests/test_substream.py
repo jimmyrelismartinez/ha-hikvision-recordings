@@ -30,7 +30,7 @@ MAIN_CLIP = Recording(
     start=MAIN_START,
     end=MAIN_END,
     size_bytes=17_800_000,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260725T211400Z&size=17800000",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260725T211400Z&size=17800000",
 )
 # Substream of the same event: starts a couple of seconds off, as real ones do.
 SUB_CLIP = Recording(
@@ -38,7 +38,7 @@ SUB_CLIP = Recording(
     start=MAIN_START + timedelta(seconds=2),
     end=MAIN_END - timedelta(seconds=1),
     size_bytes=10_500_000,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/102/?starttime=20260725T211402Z&size=10500000",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/102/?starttime=20260725T211402Z&size=10500000",
 )
 # A neighbouring substream event that the padded search window also catches; it
 # must lose to SUB_CLIP on overlap.
@@ -47,15 +47,15 @@ SUB_NEIGHBOUR = Recording(
     start=MAIN_START - timedelta(seconds=28),
     end=MAIN_START - timedelta(seconds=3),
     size_bytes=5_000_000,
-    playback_uri="rtsp://10.10.11.56/Streaming/tracks/102/?starttime=20260725T211332Z&size=5000000",
+    playback_uri="rtsp://192.0.2.56/Streaming/tracks/102/?starttime=20260725T211332Z&size=5000000",
 )
 
 MAIN_PAYLOAD = b"MAINSTREAM-" + b"m" * 4000
 SUB_PAYLOAD = b"SUBSTREAM-" + b"s" * 2000
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}],
 }

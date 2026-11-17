@@ -284,7 +284,7 @@ One branch, one PR (owner chose "lite"), commits per phase.
 1. Is a Reolink-only install (no DVR) worth supporting now, or keep the DVR required?
    (Plan: optional — small cost.)
 2. Very busy Reolink days: is there a per-search file cap? Probe again on the busiest day.
-3. Hikvision paging: OK to run `verify_dvr_contract.py` against the DVR (10.10.11.56) from
+3. Hikvision paging: OK to run `verify_dvr_contract.py` against the DVR (192.0.2.56) from
    this Mac? Needs DVR credentials via a secure prompt.
 
 ---

@@ -11,9 +11,9 @@ from hikvision_recordings.app.config import (
 )
 
 VALID = {
-    "dvr_host": "10.10.11.56",
+    "dvr_host": "192.0.2.56",
     "dvr_port": 80,
-    "dvr_username": "Jimmy",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "dvr_use_https": False,
     "dvr_time_mode": "auto",
@@ -27,14 +27,14 @@ VALID = {
 
 def test_loads_valid_options():
     cfg = load_config(VALID)
-    assert cfg.dvr_host == "10.10.11.56"
+    assert cfg.dvr_host == "192.0.2.56"
     assert cfg.channels == (Channel(101, "DriveWay1"), Channel(401, "ENTRYWAY"))
-    assert cfg.base_url == "http://10.10.11.56:80"
+    assert cfg.base_url == "http://192.0.2.56:80"
 
 
 def test_https_changes_base_url():
     cfg = load_config({**VALID, "dvr_use_https": True, "dvr_port": 443})
-    assert cfg.base_url == "https://10.10.11.56:443"
+    assert cfg.base_url == "https://192.0.2.56:443"
 
 
 def test_defaults_are_applied():
@@ -87,7 +87,7 @@ def test_load_from_file(tmp_path):
     path.write_text(json.dumps(VALID), encoding="utf-8")
     cfg = load_config_from_file(str(path))
     assert isinstance(cfg, Config)
-    assert cfg.dvr_username == "Jimmy"
+    assert cfg.dvr_username == "viewer"
 
 
 def test_missing_file_raises(tmp_path):

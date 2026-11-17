@@ -4,7 +4,7 @@
 Reads DVR_HOST / DVR_USER / DVR_PASS from the environment. Prints findings only —
 never the password, never any video. Run:
 
-    DVR_HOST=10.10.11.56 DVR_USER=Jimmy DVR_PASS=... \
+    DVR_HOST=192.0.2.56 DVR_USER=viewer DVR_PASS=... \
       .venv/bin/python scripts/verify_dvr_contract.py --channel 101 --hours 6
 """
 from __future__ import annotations

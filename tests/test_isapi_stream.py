@@ -19,8 +19,8 @@ async def _drain(agen):
     return [c async for c in agen]
 
 OPTIONS = {
-    "dvr_host": "10.10.11.56",
-    "dvr_username": "Jimmy",
+    "dvr_host": "192.0.2.56",
+    "dvr_username": "viewer",
     "dvr_password": "s3cret",
     "channels": [{"id": 101, "name": "DriveWay1"}],
     "max_concurrent_downloads": 1,
@@ -45,7 +45,7 @@ async def test_probe_clock_uses_device_time(device_time):
     tests/test_isapi_clock.py. Do not "simplify" this back to asserting
     source == "device" / the declared offset; that assertion was asserting the bug.
     """
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(200, text=device_time)
     )
     client = make_client()
@@ -64,7 +64,7 @@ async def test_probe_clock_uses_device_time(device_time):
 
 @respx.mock
 async def test_time_mode_utc_forces_zero_offset(device_time):
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(200, text=device_time)
     )
     client = make_client(dvr_time_mode="utc")
@@ -76,7 +76,7 @@ async def test_time_mode_utc_forces_zero_offset(device_time):
 
 @respx.mock
 async def test_ping_succeeds_on_200(device_time):
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(200, text=device_time)
     )
     client = make_client()
@@ -86,7 +86,7 @@ async def test_ping_succeeds_on_200(device_time):
 
 @respx.mock
 async def test_ping_maps_401_to_auth_error():
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         return_value=httpx.Response(401, text="unauthorized")
     )
     client = make_client()
@@ -97,7 +97,7 @@ async def test_ping_maps_401_to_auth_error():
 
 @respx.mock
 async def test_ping_maps_connect_error_to_unreachable():
-    respx.get("http://10.10.11.56:80/ISAPI/System/time").mock(
+    respx.get("http://192.0.2.56:80/ISAPI/System/time").mock(
         side_effect=httpx.ConnectError("no route to host")
     )
     client = make_client()
@@ -108,7 +108,7 @@ async def test_ping_maps_connect_error_to_unreachable():
 
 @respx.mock
 async def test_search_posts_body_and_parses(search_ok):
-    route = respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/search").mock(
+    route = respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/search").mock(
         return_value=httpx.Response(200, text=search_ok)
     )
     client = make_client(dvr_time_mode="utc")
@@ -127,7 +127,7 @@ async def test_search_posts_body_and_parses(search_ok):
 
 @respx.mock
 async def test_401_becomes_auth_error(search_ok):
-    respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/search").mock(
+    respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/search").mock(
         return_value=httpx.Response(401, text="unauthorized")
     )
     client = make_client(dvr_time_mode="utc")
@@ -143,7 +143,7 @@ async def test_401_becomes_auth_error(search_ok):
 
 @respx.mock
 async def test_connect_error_becomes_unreachable():
-    respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/search").mock(
+    respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/search").mock(
         side_effect=httpx.ConnectError("no route to host")
     )
     client = make_client(dvr_time_mode="utc")
@@ -159,11 +159,11 @@ async def test_connect_error_becomes_unreachable():
 
 @respx.mock
 async def test_stream_download_yields_bytes_and_escapes_uri():
-    route = respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/download").mock(
+    route = respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/download").mock(
         return_value=httpx.Response(200, content=b"IMKH" + b"\x00" * 1000)
     )
     client = make_client(dvr_time_mode="utc")
-    uri = "rtsp://10.10.11.56/Streaming/tracks/101/?starttime=20260724T132029Z&size=1"
+    uri = "rtsp://192.0.2.56/Streaming/tracks/101/?starttime=20260724T132029Z&size=1"
     chunks = [c async for c in client.stream_download(uri)]
     assert b"".join(chunks).startswith(b"IMKH")
     sent = route.calls[0].request.content.decode()
@@ -173,12 +173,12 @@ async def test_stream_download_yields_bytes_and_escapes_uri():
 
 @respx.mock
 async def test_download_5xx_becomes_busy():
-    respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/download").mock(
+    respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/download").mock(
         return_value=httpx.Response(503, text="busy")
     )
     client = make_client(dvr_time_mode="utc")
     with pytest.raises(DvrBusy):
-        async for _ in client.stream_download("rtsp://10.10.11.56/Streaming/tracks/101/?a=1"):
+        async for _ in client.stream_download("rtsp://192.0.2.56/Streaming/tracks/101/?a=1"):
             pass
     await client.aclose()
 
@@ -191,11 +191,11 @@ async def test_stream_download_sequential_calls_both_succeed():
     would block on acquisition and eventually raise DvrBusy once BUSY_TIMEOUT_S
     elapses. The outer wait_for bounds that at 2s instead of the production 10s,
     so a regression fails fast rather than stalling the suite."""
-    respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/download").mock(
+    respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/download").mock(
         return_value=httpx.Response(200, content=b"IMKH" + b"\x00" * 1000)
     )
     client = make_client(dvr_time_mode="utc")
-    uri = "rtsp://10.10.11.56/Streaming/tracks/101/?a=1"
+    uri = "rtsp://192.0.2.56/Streaming/tracks/101/?a=1"
 
     chunks1 = await _drain(client.stream_download(uri))
     assert b"".join(chunks1).startswith(b"IMKH")
@@ -212,11 +212,11 @@ async def test_stream_download_overlapping_second_becomes_busy(monkeypatch):
     the first is still mid-stream (semaphore held, not yet released) must raise
     DvrBusy rather than block for the production BUSY_TIMEOUT_S (10s)."""
     monkeypatch.setattr(isapi, "BUSY_TIMEOUT_S", 0.1)
-    route = respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/download").mock(
+    route = respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/download").mock(
         return_value=httpx.Response(200, content=b"IMKH" + b"\x00" * 1000)
     )
     client = make_client(dvr_time_mode="utc")
-    uri = "rtsp://10.10.11.56/Streaming/tracks/101/?a=1"
+    uri = "rtsp://192.0.2.56/Streaming/tracks/101/?a=1"
 
     first = client.stream_download(uri)
     await first.__anext__()  # acquires the semaphore; generator stays open
@@ -236,13 +236,13 @@ async def test_stream_download_overlapping_second_becomes_busy(monkeypatch):
 async def test_stream_download_remote_protocol_error_becomes_unreachable():
     """A dropped connection mid-transfer (what a DVR session-cap kick looks like)
     must surface as the typed DvrUnreachable, not a raw httpx exception."""
-    respx.post("http://10.10.11.56:80/ISAPI/ContentMgmt/download").mock(
+    respx.post("http://192.0.2.56:80/ISAPI/ContentMgmt/download").mock(
         side_effect=httpx.RemoteProtocolError(
             "peer closed connection without sending complete message body"
         )
     )
     client = make_client(dvr_time_mode="utc")
     with pytest.raises(DvrUnreachable):
-        async for _ in client.stream_download("rtsp://10.10.11.56/Streaming/tracks/101/?a=1"):
+        async for _ in client.stream_download("rtsp://192.0.2.56/Streaming/tracks/101/?a=1"):
             pass
     await client.aclose()
