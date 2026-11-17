@@ -1,6 +1,7 @@
-# External playback: short-lived signed clip/snapshot links (issue #5) — DRAFT
+# External playback: short-lived signed clip links (issue #5)
 
-Status: draft plan, awaiting user answers (§9) → goldfish review → implement
+Status: approved; goldfish resolutions in §12. **Precedence: §12 > §11 > §1–§10.**
+Snapshots (`kind: snapshot`) are out of scope everywhere (§11.3), despite older text below.
 Scope: this repo = add-on side. HA rest_command/script/automation and the frame
 firewall rule live in the homelab repo (Jimmy).
 
@@ -176,3 +177,144 @@ Changes these make to the draft:
   error. Keep at most 2 live link-stage entries and evict the oldest.
 - **HEVC:** the on-device step confirms that an HEVC channel's fMP4 plays on the
   frame.
+
+## 12. Goldfish resolutions (2026-11-17) — binding for the implementer
+
+### Blockers
+- **B1 One builder, two apps.** Replace the import-time `app = _build_default_app()`
+  with `create_apps(config, ...) -> (ingress_app, link_app | None)` built from **one**
+  closure, so both apps share `registry`, `dvr`, `reolink_by_key`, the stage helpers,
+  and `HaClient`.
+  - `SUPERVISOR_TOKEN` is popped exactly once, inside it.
+  - Keep `create_app()` as a thin wrapper returning `[0]` for the existing tests.
+  - New launcher `hikvision_recordings/app/serve.py` is the only production builder.
+    `run.sh` `exec`s `python3 -m hikvision_recordings.app.serve` and passes
+    `LOG_LEVEL` via env.
+  - Test: with `SUPERVISOR_TOKEN` set, the launcher's ingress app has
+    `IngressOnlyMiddleware.enabled` true.
+- **B2 Own prefix and sweep.** Link stages use prefix `hiklink-`; `_stage_clip` takes
+  the prefix as a parameter. `_sweep_stale_stages` keeps touching only `hikclip-`.
+  - The link cache sweeps its own entries: on every mint and fetch, plus a 60 s
+    periodic task.
+  - Hard cap: an entry is deleted at most 900 s after it finished staging, whatever
+    tokens remain.
+  - A token's `exp` is never later than its entry's hard-cap deletion time.
+  - On startup, delete any leftover `hiklink-*` files.
+
+### Token and entries
+- The token references a **link-entry id**: random 16 bytes, b64url. It does not
+  reference the registry `clip_id`.
+- The entry holds `Clip`, quality, staged path (DVR only), `created`, `hard_expiry`.
+- Entries are de-duplicated by `(camera_key, clip start, main_ref, quality)`, so a
+  re-mint reuses the entry.
+- Token = `b64url(payload) "." b64url(HMAC)`.
+  - `payload = {v:1, e: entry_id, x: exp}`.
+  - Cap the token length at 512.
+  - Verify the HMAC on the raw segment **before** JSON-decoding.
+  - Any malformed token → 403.
+- Served bytes come only from the entry (path, or `Clip` for Reolink). Nothing from
+  the URL beyond the token touches the filesystem.
+- Evicted or unknown entry with a valid signature → 410. Never re-stage on fetch.
+
+### Mint endpoint
+- The bearer check is **inside the endpoint**, for every peer, ingress included,
+  and regardless of `SUPERVISOR_TOKEN`.
+  - Compare as bytes: `hmac.compare_digest(a.encode(), b.encode())`.
+  - Never log the `Authorization` header or the request body.
+- Middleware exemption: exactly `method == "POST" and scope["path"] == "/internal/mint"`.
+  `/internal/mint/` and GET stay 403 for non-ingress peers.
+- `external_links` false or link config invalid:
+  - the route returns 404 (off) or 503 (invalid);
+  - an invalid config logs an error and does not start the link listener;
+  - `load_config` never raises for link options, so the UI must keep working.
+- Request: `{camera, since?, wait_s?, event?, quality?}`.
+  - `camera` is a key (`dvr-101`, `reolink-0`), or an exact display name as fallback.
+  - `quality` defaults to `sd`, with the existing main fallback.
+  - `wait_s` is 0–60.
+  - `since` is an ISO time; no timezone means UTC, as `_parse_utc` does. Future, or
+    older than 24 h → 400.
+  - `event` that the camera kind can't produce → 400. DVR: motion/scheduled/alarm.
+    Reolink: what its filename parser yields.
+- Response is always an absolute URL: `{url, expires_at, camera, start, end,
+  duration_s, events, content_type: "video/mp4"}`.
+- Errors (JSON `detail`):
+
+  | Status | `detail` | Meaning |
+  |---|---|---|
+  | 400 | `bad_request` / `unknown_camera` / `unsupported_event` | Bad input |
+  | 401 | — | Bad or missing bearer |
+  | 404 | `not_ready` | No matching clip yet |
+  | 413 | `too_large` | Clip over the `max_stage_mb` cap |
+  | 503 | `busy` | `DvrBusy` / staging failure; retry |
+  | 503 | `disabled_misconfigured` | Link config invalid |
+
+### Clip matching (replaces §4 rule)
+- Search window `[since - 30 s, now]`.
+- Candidate: newest clip with `end >= since` and `start <= since + wait_s`, matching
+  `event` if given.
+- It must be **closed**:
+  - `end <= now - 3 s`;
+  - its `end` is unchanged across two consecutive polls (polls every 5 s).
+- Without `since`: newest closed clip in the last 24 h, matching `event`.
+- While polling the DVR, search the main track only; skip the sub search.
+- Total mint bound: `wait_s` (≤ 60) plus staging. The README uses `rest_command`
+  `timeout: 120` (cap `wait_s` at 60 in the example).
+
+### Staging (DVR)
+- Staging runs as a **detached task** with the existing done-callback single-flight
+  pattern (`ha.py` / `thumbnail.py`). Waiters use `asyncio.shield`, so a cancelled
+  mint never kills a shared stage.
+- Failures are not cached.
+- Mint waits for staging to finish; `exp` is computed after staging.
+- `max_stage_mb` stays the **per-clip** cap; over it → 413.
+- Aggregate = at most 2 link entries; evict the oldest. Worst-case RAM is
+  `2 × max_stage_mb` plus the UI stages; document it.
+
+### Reolink
+- No staging. Fetch proxies Range from the entry's stored `Clip`; no registry lookup.
+- HEAD answers from `clip.size_bytes` without contacting the camera.
+- Link fetches may wait up to 30 s for a download slot (UI keeps 10 s).
+
+### Link app
+- Bare Starlette with exactly one `Route("/m/{token}/clip.mp4", methods=["GET"])`;
+  Starlette adds HEAD.
+  - No docs, openapi, static or `/api` routes.
+  - Test that `/`, `/docs`, `/openapi.json`, `/api/health` and `/m/x` all return 404.
+- `Content-Type: video/mp4`, `Cache-Control: no-store`, Range → 206.
+
+### Servers and logging
+- Two `uvicorn.Server`s in one event loop: 8099 starts first.
+- Both use `access_log=False` and `server_header=False`.
+- The link server runs at `max(user level, info)`, so never trace or debug: uvicorn
+  trace dumps paths.
+  - Test at TRACE with caplog that a token never appears in the logs.
+- The link server uses `lifespan="off"`. Its `serve()` is wrapped so a bind or
+  runtime failure logs an error and leaves 8099 running.
+- On shutdown, stop the link server before the ingress lifespan closes the clients.
+
+### Config
+- `external_links: false`.
+- `external_mint_token: password?`: required ≥ 24 characters when on.
+- `external_link_ttl_s: int(60,900)`: default 300.
+- `external_base_url: str?`: required when on.
+  - http/https only; no path, query or fragment; trailing `/` stripped.
+- `ports: {"8100/tcp": null}` plus `ports_description`.
+- Docs note: even when unmapped, 8100 is reachable from other containers on the
+  hassio network. That is acceptable because it is token-gated.
+
+### Docs
+- Firewall: issue #5 says the frame currently reaches only specific HA ports, so the
+  README says "allow the player → HA host:<port> if your network filters it".
+  - The homelab rule is Jimmy's.
+  - Supervisor publishes the port on all host interfaces.
+- Token exposure in the recorder, the TTL behaviour (a link expiring mid-playback
+  fails later Range requests), worst-case RAM, and `entity_picture` for snapshots.
+- HA example: `rest_command` mint (bearer `!secret`, `timeout: 120`,
+  `response_variable`) → `media_player.play_media` with `media_content_type: video/mp4`.
+
+### On-device (Jimmy, last)
+- Add-on hostname.
+- Whether the DVR lists open segments, and its indexing delay.
+- Continuous vs event recording.
+- An HEVC channel playing on the frame (no `hvc1` tag today).
+- One clip end-to-end via `play_media`.
