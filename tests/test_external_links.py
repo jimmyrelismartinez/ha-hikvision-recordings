@@ -1121,3 +1121,19 @@ def test_startup_cleanup_of_leftover_hiklink_files(staging, monkeypatch):
     with TestClient(ingress):
         pass
     assert not leftover.exists()
+
+
+def test_wait_s_cap_is_120_seconds(staging):
+    """On-device: a motion clip closes 30-70 s after the trigger and is listed ~20 s
+    later, so 60 s was too short. 120 is accepted; anything above is a bad request."""
+    assert main_module.MINT_WAIT_MAX_S == 120
+    (ingress, _), _ = _apps()
+    _freeze_clock(ingress, NOW)
+    with TestClient(ingress) as client:
+        r = client.post(
+            "/internal/mint",
+            json={"camera": "dvr-101", "wait_s": 121},
+            headers=_auth(),
+        )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "bad_request"

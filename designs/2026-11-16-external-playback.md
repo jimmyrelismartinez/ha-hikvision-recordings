@@ -318,3 +318,12 @@ Changes these make to the draft:
 - Continuous vs event recording.
 - An HEVC channel playing on the frame (no `hvc1` tag today).
 - One clip end-to-end via `play_media`.
+
+## 13. On-device results (2026-11-17) and v0.7.1
+- All §12 on-device checks passed: the DVR and Reolink clips played on the frame, and
+  bad or expired links were refused. No firewall change was needed. All DVR channels
+  are H.264, so the HEVC check was not applicable.
+- DVR motion clips close 30–70 s after the trigger, and the DVR lists them about 18 s
+  after they close. It never serves an open segment.
+  - The 60 s `wait_s` cap therefore made the first mint return `not_ready`.
+  - v0.7.1 raises the cap to 120 s; the README example uses `timeout: 180`.
