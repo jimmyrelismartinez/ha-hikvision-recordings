@@ -1527,10 +1527,23 @@ async function runCase({ clip, behaviour, raw, quality }) {
         check('wide: filmstrip cards are horizontal (thumb beside text)',
               !!card && card.flexDirection === 'row', `card=${card && card.flexDirection}`);
       }
+      {
+        // A 1-minute clip is ~0.07% of the day; no fixed 3% floor (that overlapped segments).
+        const seg = document.querySelector('#daybar .db-seg');
+        const w = seg ? parseFloat(seg.style.width) : NaN;
+        check('wide: day-bar segment width is proportional (no 3% floor)', seg && w < 1, `width=${seg && seg.style.width}`);
+      }
 
       // Restore narrow for any trailing checks.
       window.__forceWide = false;
       applyLayoutMode();
+      {
+        const ct = document.getElementById('camera-clip-time');
+        ct.hidden = false; ct.textContent = 'x';
+        check('narrow: toolbar clip time stays hidden (player head shows it)',
+              getComputedStyle(ct).display === 'none', getComputedStyle(ct).display);
+        ct.hidden = true; ct.textContent = '';
+      }
       if (current) closePlayer();
       location.hash = '#/';
       await until(() => document.body.classList.contains('view-home'));
