@@ -511,3 +511,21 @@ async def test_launcher_keeps_ingress_middleware_enabled(monkeypatch, staging):
                 found = True
     assert found, ingress.user_middleware
     assert link is not None
+
+
+def test_link_server_bind_failure_does_not_stop_the_process():
+    """uvicorn raises SystemExit(1) on a port clash; serve_isolated must swallow it."""
+    import asyncio
+
+    from hikvision_recordings.app.serve import serve_isolated
+
+    class _ClashingServer:
+        async def serve(self):
+            raise SystemExit(1)
+
+    class _CrashingServer:
+        async def serve(self):
+            raise RuntimeError("boom")
+
+    asyncio.run(serve_isolated(_ClashingServer()))
+    asyncio.run(serve_isolated(_CrashingServer()))

@@ -38,6 +38,19 @@ def _link_log_level(user_level: str) -> str:
     return user_level if order[user_level] <= order["info"] else "info"
 
 
+async def serve_isolated(server: "uvicorn.Server") -> None:
+    """Run the link server so that no failure of it can stop the ingress UI."""
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        raise
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — isolate from 8099
+        # uvicorn calls sys.exit(1) when it cannot bind (port in use);
+        # SystemExit is not an Exception, and escaping a task it would
+        # stop the whole event loop — and the ingress UI with it.
+        LOG.error("link server failed (ingress keeps running): %r", exc)
+
+
 async def _run() -> None:
     user_level = _log_level(os.environ.get("LOG_LEVEL", "info"))
     logging.basicConfig(
@@ -76,14 +89,6 @@ async def _run() -> None:
             )
         )
 
-        async def _link_serve() -> None:
-            try:
-                await link_server.serve()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — isolate from 8099
-                LOG.error("link server failed (ingress keeps running): %s", exc)
-
         async def _stop_link() -> None:
             if link_server is None:
                 return
@@ -105,7 +110,9 @@ async def _run() -> None:
     ingress_task = asyncio.create_task(ingress.serve(), name="ingress-serve")
     if link_server is not None:
         LOG.info("Starting external link listener on :%s …", LINK_PORT)
-        link_task = asyncio.create_task(_link_serve(), name="link-serve")
+        link_task = asyncio.create_task(
+            serve_isolated(link_server), name="link-serve"
+        )
 
     await ingress_task
     if link_task is not None and not link_task.done():
