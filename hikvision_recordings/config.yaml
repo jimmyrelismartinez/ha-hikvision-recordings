@@ -1,5 +1,5 @@
 name: DVR Recordings
-version: "0.6.0"
+version: "0.7.0"
 slug: hikvision_recordings
 description: Browse, play and download existing recordings from a Hikvision DVR/NVR and Reolink cameras
 url: https://github.com/jimmyrelismartinez/ha-hikvision-recordings
@@ -19,8 +19,13 @@ homeassistant_api: true
 panel_icon: mdi:cctv
 panel_title: Recordings
 panel_admin: false
-# NOTE: no `ports:` key on purpose. Ingress-only means the container publishes
-# nothing on the host, so this add-on cannot collide with Scrypted or anything else.
+# Link listener (v0.7). null = unmapped until the user sets a host port in the
+# add-on Network tab. Even when unmapped, 8100 is reachable from other containers
+# on the hassio network — that is acceptable because fetches are token-gated.
+ports:
+  8100/tcp: null
+ports_description:
+  8100/tcp: External playback links (signed clip URLs). Leave unmapped unless a LAN player needs them.
 options:
   dvr_host: ""
   dvr_port: 80
@@ -41,6 +46,11 @@ options:
   # verify_ssl, channel (0). Leave empty if you only have the DVR.
   reolink_cameras: []
   log_level: info
+  # Short-lived signed clip URLs for LAN players (off by default).
+  external_links: false
+  external_mint_token: ""
+  external_link_ttl_s: 300
+  external_base_url: ""
 schema:
   # dvr_* may be left blank when at least one Reolink camera is configured.
   dvr_host: str?
@@ -69,3 +79,7 @@ schema:
       channel: int?
       ha_camera: "match(^camera\\.[a-z0-9_]{1,64}$)?"
   log_level: list(trace|debug|info|warning|error|critical)
+  external_links: bool
+  external_mint_token: password?
+  external_link_ttl_s: int(60,900)
+  external_base_url: str?

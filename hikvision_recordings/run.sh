@@ -16,12 +16,10 @@ case "${LOG_LEVEL}" in
   *) LOG_LEVEL="info" ;;
 esac
 
-bashio::log.info "Starting DVR Recordings on :8099 (ingress) …"
+export LOG_LEVEL
 
-# Bind 0.0.0.0: Supervisor's ingress proxy connects from 172.30.32.2.
-# Binding 127.0.0.1 here would make the panel return 502.
-exec python3 -m uvicorn hikvision_recordings.app.main:app \
-  --host 0.0.0.0 \
-  --port 8099 \
-  --log-level "${LOG_LEVEL}" \
-  --no-access-log
+bashio::log.info "Starting DVR Recordings (ingress :8099, optional links :8100) …"
+
+# One process, two uvicorn.Server instances — see hikvision_recordings.app.serve.
+# Bind 0.0.0.0 inside serve.py: Supervisor's ingress proxy connects from 172.30.32.2.
+exec python3 -m hikvision_recordings.app.serve
