@@ -187,3 +187,38 @@ def test_ha_camera_reject_names_the_reolink_row():
             **VALID,
             "reolink_cameras": [{**REOLINK, "ha_camera": "light.porch"}],
         })
+
+
+# ── v0.7.0: external links (never raise on bad link options) ─────────────────
+
+def test_external_links_defaults_off():
+    cfg = load_config(VALID)
+    assert cfg.external_links is False
+    assert cfg.external_links_ok is False
+    assert cfg.external_link_ttl_s == 300
+
+
+def test_external_links_ok_when_complete():
+    cfg = load_config({
+        **VALID,
+        "external_links": True,
+        "external_mint_token": "x" * 24,
+        "external_base_url": "http://192.0.2.10:8100/",
+        "external_link_ttl_s": 600,
+    })
+    assert cfg.external_links_ok is True
+    assert cfg.external_base_url == "http://192.0.2.10:8100"
+    assert cfg.external_link_ttl_s == 600
+    assert "x" * 24 not in repr(cfg)
+
+
+def test_external_links_invalid_never_raises():
+    cfg = load_config({
+        **VALID,
+        "external_links": True,
+        "external_mint_token": "short",
+        "external_base_url": "http://192.0.2.10:8100/path",
+        "external_link_ttl_s": 9999,
+    })
+    assert cfg.external_links is True
+    assert cfg.external_links_ok is False
