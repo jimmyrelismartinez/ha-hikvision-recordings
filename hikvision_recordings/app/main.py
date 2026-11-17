@@ -53,7 +53,7 @@ from .thumbnail import (
 )
 from .token import verify as verify_token
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 LOG = logging.getLogger(__name__)
 WWW_DIR = Path(os.environ.get("ADDON_WWW_DIR", "/www"))
 
@@ -74,7 +74,7 @@ LINK_BUSY_TIMEOUT_S = 30.0
 CLOSED_CLIP_SLACK_S = 3.0
 MATCH_LOOKBACK_S = 30.0
 MINT_POLL_S = 5.0
-MINT_WAIT_MAX_S = 60
+MINT_WAIT_MAX_S = 120  # on-device: motion clips close 30-70 s after the trigger, +~20 s to list
 # Without `since`, prefer a short trailing window so paged DVR search (oldest-first,
 # capped at max_search_results) still sees the newest clips on busy channels.
 MINT_RECENT_HOURS = 2

@@ -79,7 +79,7 @@ no-page-scroll layout: video fills the space above a bottom dock with the filter
 a 24-hour day bar, and a horizontal thumbnail filmstrip (oldest left, newest right).
 Portrait phones and the home / All recordings pages keep the previous layout.
 
-### External playback links (v0.7.0)
+### External playback links (v0.7.0, wait limit raised in v0.7.1)
 
 Short-lived signed clip URLs for another LAN device (for example a digital frame
 `media_player`). Snapshots are **not** minted here — use the camera entity's
@@ -134,8 +134,8 @@ rest_command:
     headers:
       Authorization: !secret dvr_mint_token
       Content-Type: application/json
-    payload: '{"camera":"dvr-101","since":"{{ since }}","wait_s":60,"event":"motion"}'
-    timeout: 120
+    payload: '{"camera":"dvr-101","since":"{{ since }}","wait_s":120,"event":"motion"}'
+    timeout: 180
 
 script:
   play_driveway_on_frame:
@@ -155,9 +155,19 @@ script:
 ```
 
 Use `response_variable` so the script can read the absolute `url` from the JSON body.
-Cap `wait_s` at 60; `timeout: 120` covers wait plus staging. A mint that returns
-404 `not_ready` (no matching closed clip yet) fails the template condition so the
-frame is not handed an empty URL.
+
+- **Waiting for the motion clip.** A DVR only lists a clip once it has closed. On a
+  typical motion recording that is 30–70 s after the trigger, plus about 20 s before
+  the DVR lists it. So the example waits up to `wait_s: 120` (the maximum), with
+  `timeout: 180` to cover the wait plus staging.
+- **404 `not_ready`.** No matching closed clip appeared in time. The template
+  condition stops the script, so the player is never handed an empty URL. Run the
+  script again to retry.
+- **Very short clips.** Some players (DLNA frames among them) hold the last frame and
+  keep reporting `playing` after a short clip ends. Add a `media_player.media_stop`
+  (or your player's stop script) after a delay if you want the screen back.
+- **Secrets.** `secrets.yaml` holds `Bearer <token>`, while the add-on option holds
+  the raw token.
 
 ### Browsing and playback (v0.3.0)
 
